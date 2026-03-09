@@ -1,0 +1,13 @@
+# Data and outputs (adjust as needed)
+data/**
+!data/README.md
+
+outputs/**
+!outputs/**/README.md
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+.env
