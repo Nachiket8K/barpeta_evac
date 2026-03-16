@@ -10,7 +10,7 @@ Contains the notebook’s core computations:
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Set
+from typing import Iterable, Optional, Set, Sequence, Dict, Any
 
 from .config import (
     np, gpd, rowcol, distance_transform_edt,
@@ -360,3 +360,124 @@ def add_flood_susceptibility_index(
         out[f"{out_prefix}{m}"] = fsi
 
     return out
+
+
+# ---------------------------------------------------------------------
+# Weekly May->Oct mask interpolation (LULC + DEM)
+# ---------------------------------------------------------------------
+
+def _resample_dem_to_match_lulc(dem_src, ref_src) -> np.ndarray:
+    """
+    Reproject/resample DEM onto the LULC reference grid.
+    """
+    from rasterio.warp import reproject, Resampling
+
+    dem = np.full((ref_src.height, ref_src.width), np.nan, dtype=np.float32)
+    reproject(
+        source=dem_src.read(1),
+        destination=dem,
+        src_transform=dem_src.transform,
+        src_crs=dem_src.crs,
+        dst_transform=ref_src.transform,
+        dst_crs=ref_src.crs,
+        resampling=Resampling.bilinear,
+    )
+    return dem
+
+
+def _low_elevation_risk(dem_arr: np.ndarray, q_low: float = 0.05, q_high: float = 0.95) -> np.ndarray:
+    """
+    Convert DEM to [0,1] risk where lower elevation means higher risk.
+    """
+    d = np.asarray(dem_arr, dtype=float)
+    valid = np.isfinite(d)
+    out = np.zeros_like(d, dtype=np.float32)
+    if not np.any(valid):
+        return out
+
+    lo = float(np.nanquantile(d[valid], q_low))
+    hi = float(np.nanquantile(d[valid], q_high))
+    den = max(hi - lo, 1e-6)
+    scaled = np.clip((d - lo) / den, 0.0, 1.0)
+    out = (1.0 - scaled).astype(np.float32)
+    out[~valid] = 0.0
+    return out
+
+
+def build_weekly_wet_masks_from_may_oct_dem(
+    src_may,
+    src_oct,
+    dem_src,
+    *,
+    n_frames: int,
+    wet_classes: Optional[Set[int]] = None,
+    dem_weight: float = 0.25,
+    threshold: float = 0.5,
+    nodata_values: Optional[Iterable[int]] = None,
+) -> Dict[str, Any]:
+    """
+    Build weekly wet masks by blending May and Oct wet classes + DEM risk.
+
+    For each frame alpha in [0,1]:
+      base = (1-alpha)*wet_may + alpha*wet_oct
+      score = clip(base + dem_weight*alpha*dem_low*(1-base), 0, 1)
+      mask  = score >= threshold
+    """
+    if n_frames < 2:
+        raise ValueError("n_frames must be >= 2")
+
+    if wet_classes is None:
+        wet_classes = set(WET_CLASS_VALUES)
+
+    may = src_may.read(1)
+    oct_ = src_oct.read(1)
+    if may.shape != oct_.shape:
+        raise ValueError("May and Oct LULC rasters must have identical shape")
+
+    if src_may.crs is None or src_oct.crs is None:
+        raise ValueError("LULC rasters must have CRS")
+    if src_may.crs != src_oct.crs:
+        raise ValueError("May and Oct LULC rasters must have same CRS")
+
+    nodata_set = set()
+    if nodata_values is not None:
+        nodata_set.update(int(v) for v in nodata_values)
+    for src in (src_may, src_oct):
+        if src.nodata is not None:
+            nodata_set.add(int(src.nodata))
+
+    wet_may = np.isin(may, list(wet_classes)).astype(np.float32)
+    wet_oct = np.isin(oct_, list(wet_classes)).astype(np.float32)
+
+    invalid = np.zeros_like(wet_may, dtype=bool)
+    if len(nodata_set) > 0:
+        invalid |= np.isin(may, list(nodata_set))
+        invalid |= np.isin(oct_, list(nodata_set))
+
+    dem_on_lulc = _resample_dem_to_match_lulc(dem_src, src_may)
+    dem_low = _low_elevation_risk(dem_on_lulc)
+
+    masks = []
+    scores = []
+    for i in range(n_frames):
+        alpha = float(i / (n_frames - 1))
+        base = (1.0 - alpha) * wet_may + alpha * wet_oct
+        score = np.clip(base + float(dem_weight) * alpha * dem_low * (1.0 - base), 0.0, 1.0)
+        score = np.where(invalid, 0.0, score)
+        mask = (score >= float(threshold)).astype(np.uint8)
+
+        scores.append(score.astype(np.float32))
+        masks.append(mask)
+
+    return {
+        "masks": masks,
+        "scores": scores,
+        "transform": src_may.transform,
+        "crs": src_may.crs,
+        "shape": may.shape,
+        "meta": {
+            "dem_weight": float(dem_weight),
+            "threshold": float(threshold),
+            "wet_classes": sorted(int(v) for v in wet_classes),
+        },
+    }

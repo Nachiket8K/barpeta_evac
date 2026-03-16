@@ -14,6 +14,8 @@ import geojson
 AOI_PATH = Path("data/raw/BarpetaAOI/BarpetaAOI.shp")
 AOI_PATH_ACTUAL = Path("data/processed/barpeta_aoi.geojson")
 BUILDINGS_PATH = Path("data/raw/buildings/Buildings_barpeta.shp")
+POP_FEATURES_PATH = Path("data/raw/pop/woprized_barpeta_aoi.geojson")
+POP_RASTER_PATH = Path("data/raw/pop/ind_pop_2024.tif")
 
 # LULC rasters per month
 LULC_TIF_PATHS: Dict[str, Path] = {
@@ -41,6 +43,11 @@ def load_buildings(path: Path = BUILDINGS_PATH) -> gpd.GeoDataFrame:
     return gpd.read_file(path)
 
 
+def load_population_features(path: Path = POP_FEATURES_PATH) -> gpd.GeoDataFrame:
+    """Load vector population features (woprized geojson)."""
+    return gpd.read_file(path)
+
+
 def open_lulc_month(month: str, paths: Dict[str, Path] = LULC_TIF_PATHS):
     """Open a single LULC raster for a month (returns rasterio DatasetReader)."""
     m = month.strip().lower()
@@ -61,6 +68,11 @@ def open_all_lulc(paths: Dict[str, Path] = LULC_TIF_PATHS):
 
 def open_dem(path: Path = DEM_TIF_PATH):
     """Open DEM raster (returns rasterio DatasetReader)."""
+    return rasterio.open(path)
+
+
+def open_population_raster(path: Path = POP_RASTER_PATH):
+    """Open gridded population raster (returns rasterio DatasetReader)."""
     return rasterio.open(path)
 
 

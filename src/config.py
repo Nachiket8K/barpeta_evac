@@ -62,6 +62,12 @@ DEFAULT_DEM_NODATA: float = 0.0
 
 MONTH_KEYS: Tuple[str, ...] = ("jan", "may", "oct")
 
+# Rebuild notebook defaults (May -> Oct weekly animation + scenario tuning)
+WEEKLY_START_DATE: str = "2025-05-01"
+WEEKLY_END_DATE: str = "2025-10-31"
+DEFAULT_ACCESS_RADIUS_M: float = 1000.0
+DEFAULT_SCENARIO_SEEDS: Tuple[int, ...] = (7, 42, 101, 202, 404)
+
 EVAC_DRIVABLE_HIGHWAYS: Set[str] = {
     "trunk", "trunk_link",
     "primary", "primary_link",

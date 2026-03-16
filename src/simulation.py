@@ -119,10 +119,26 @@ def attach_edge_features_from_gdf(
         v = getattr(row, "v")
         k = getattr(row, "key")
         if not G.has_edge(u, v, k):
-            missing += 1
-            if strict:
-                raise KeyError(f"Graph does not have edge ({u}, {v}, {k})")
-            continue
+            # tolerate type mismatches from file round-trips (e.g., GraphML string keys)
+            candidates = []
+            for uu in (u, str(u)):
+                for vv in (v, str(v)):
+                    for kk in (k, str(k)):
+                        candidates.append((uu, vv, kk))
+
+            found = None
+            for uu, vv, kk in candidates:
+                if G.has_edge(uu, vv, kk):
+                    found = (uu, vv, kk)
+                    break
+
+            if found is None:
+                missing += 1
+                if strict:
+                    raise KeyError(f"Graph does not have edge ({u}, {v}, {k})")
+                continue
+
+            u, v, k = found
 
         data = G.edges[u, v, k]
         for c in cols:
@@ -474,6 +490,274 @@ def assign_people_to_buildings(
     b["people"] = counts.astype(int)
     return b
 
+
+def ensure_building_id(
+    buildings: gpd.GeoDataFrame,
+    id_col: str = "building_id",
+) -> gpd.GeoDataFrame:
+    """
+    Ensure a stable building identifier column exists.
+    """
+    b = buildings.copy()
+    if id_col in b.columns and b[id_col].notna().all():
+        return b
+    b[id_col] = np.arange(len(b), dtype=int)
+    return b
+
+
+def _infer_population_column(pop_features: gpd.GeoDataFrame) -> str:
+    """
+    Infer a plausible population column from vector population features.
+    """
+    preferred = [
+        "population",
+        "pop",
+        "pop_total",
+        "value",
+        "count",
+        "dn",
+        "sum",
+    ]
+
+    lower_map = {c.lower(): c for c in pop_features.columns}
+    for p in preferred:
+        if p in lower_map:
+            return lower_map[p]
+
+    numeric_cols = [
+        c for c in pop_features.columns
+        if c != "geometry" and pd.api.types.is_numeric_dtype(pop_features[c])
+    ]
+    if not numeric_cols:
+        raise ValueError("Could not infer population column from population features")
+
+    # Choose the numeric column with largest positive sum.
+    sums = {
+        c: float(pd.to_numeric(pop_features[c], errors="coerce").fillna(0).clip(lower=0).sum())
+        for c in numeric_cols
+    }
+    return max(sums, key=sums.get)
+
+
+def _round_preserve_total(values: np.ndarray, total: int) -> np.ndarray:
+    """
+    Round nonnegative floats to integers while preserving the requested total.
+    """
+    if len(values) == 0:
+        return np.array([], dtype=int)
+
+    vals = np.asarray(values, dtype=float)
+    vals[~np.isfinite(vals)] = 0.0
+    vals = np.clip(vals, 0.0, None)
+
+    floors = np.floor(vals).astype(int)
+    remainder = int(total - floors.sum())
+    if remainder <= 0:
+        return floors
+
+    frac = vals - floors
+    order = np.argsort(-frac)
+    out = floors.copy()
+    out[order[:remainder]] += 1
+    return out
+
+
+def allocate_population_to_buildings(
+    buildings: gpd.GeoDataFrame,
+    pop_features: gpd.GeoDataFrame,
+    *,
+    pop_col: Optional[str] = None,
+    building_id_col: str = "building_id",
+    out_col: str = "people",
+) -> gpd.GeoDataFrame:
+    """
+    Allocate polygon population into buildings using intersection-area weights.
+
+    This function enforces global population conservation by scaling allocations
+    and integer-rounding with preserved total.
+    """
+    b = ensure_building_id(buildings, id_col=building_id_col)
+    p = pop_features.copy()
+
+    if len(b) == 0:
+        b[out_col] = 0
+        return b
+
+    if len(p) == 0:
+        b[out_col] = 0
+        return b
+
+    if pop_col is None:
+        pop_col = _infer_population_column(p)
+    if pop_col not in p.columns:
+        raise KeyError(f"Population column '{pop_col}' not found")
+
+    p[pop_col] = pd.to_numeric(p[pop_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    p = p[p[pop_col] > 0].copy()
+    if len(p) == 0:
+        b[out_col] = 0
+        return b
+
+    if b.crs is None or p.crs is None:
+        raise ValueError("Both buildings and pop_features must have a CRS")
+
+    p = p.to_crs(b.crs)
+    p = p.reset_index(drop=True)
+    p["_pop_src_id"] = np.arange(len(p), dtype=int)
+
+    b_join = b[[building_id_col, "geometry"]].copy()
+    p_join = p[["_pop_src_id", pop_col, "geometry"]].copy()
+
+    inter = gpd.overlay(b_join, p_join, how="intersection", keep_geom_type=False)
+
+    if len(inter) == 0:
+        # Fallback: allocate by nearest building centroid if no overlaps exist.
+        b_cent = b[[building_id_col, "geometry"]].copy()
+        b_cent["geometry"] = b_cent.geometry.centroid
+        nearest = gpd.sjoin_nearest(
+            p[["_pop_src_id", pop_col, "geometry"]],
+            b_cent,
+            how="left",
+            distance_col="_d",
+        )
+        alloc = nearest.groupby(building_id_col, as_index=False)[pop_col].sum()
+        b = b.merge(alloc.rename(columns={pop_col: f"{out_col}_float"}), on=building_id_col, how="left")
+        b[f"{out_col}_float"] = b[f"{out_col}_float"].fillna(0.0)
+    else:
+        inter["_iarea"] = inter.geometry.area.astype(float)
+        inter_sum = inter.groupby("_pop_src_id", as_index=False)["_iarea"].sum().rename(columns={"_iarea": "_iarea_sum"})
+        inter = inter.merge(inter_sum, on="_pop_src_id", how="left")
+        inter["_w"] = np.where(inter["_iarea_sum"] > 0, inter["_iarea"] / inter["_iarea_sum"], 0.0)
+        inter["_alloc"] = inter[pop_col].astype(float) * inter["_w"].astype(float)
+
+        alloc = inter.groupby(building_id_col, as_index=False)["_alloc"].sum()
+        b = b.merge(alloc, on=building_id_col, how="left")
+        b[f"{out_col}_float"] = b["_alloc"].fillna(0.0)
+        b = b.drop(columns=["_alloc"], errors="ignore")
+
+    total_pop = int(round(float(p[pop_col].sum())))
+    raw = b[f"{out_col}_float"].to_numpy(dtype=float)
+    raw_total = float(raw.sum())
+
+    if raw_total <= 0:
+        scaled = np.full(len(b), float(total_pop) / max(len(b), 1), dtype=float)
+    else:
+        scaled = raw * (float(total_pop) / raw_total)
+
+    b[out_col] = _round_preserve_total(scaled, total=total_pop)
+    b[f"{out_col}_weight"] = np.where(total_pop > 0, b[out_col].astype(float) / float(total_pop), 0.0)
+    return b
+
+
+def allocate_population_from_raster_to_buildings(
+    buildings: gpd.GeoDataFrame,
+    pop_raster_src,
+    *,
+    building_id_col: str = "building_id",
+    out_col: str = "people",
+    total_population: Optional[int] = None,
+) -> gpd.GeoDataFrame:
+    """
+    Allocate raster population to buildings via centroid-sampled weights.
+    """
+    b = ensure_building_id(buildings, id_col=building_id_col)
+    if len(b) == 0:
+        b[out_col] = 0
+        return b
+
+    if b.crs is None or pop_raster_src.crs is None:
+        raise ValueError("Buildings and population raster must have CRS")
+
+    pts = b.to_crs(pop_raster_src.crs).geometry.centroid
+    coords = [(float(p.x), float(p.y)) if p is not None and not p.is_empty else (np.nan, np.nan) for p in pts]
+
+    vals = []
+    for x, y in coords:
+        if not np.isfinite(x) or not np.isfinite(y):
+            vals.append(0.0)
+            continue
+        try:
+            s = next(pop_raster_src.sample([(x, y)]))[0]
+            vals.append(float(s) if np.isfinite(s) else 0.0)
+        except Exception:
+            vals.append(0.0)
+
+    w = np.asarray(vals, dtype=float)
+    w[~np.isfinite(w)] = 0.0
+    w = np.clip(w, 0.0, None)
+
+    if total_population is None:
+        arr = pop_raster_src.read(1).astype(float)
+        nd = pop_raster_src.nodata
+        if nd is not None:
+            arr[arr == float(nd)] = np.nan
+        total_population = int(round(float(np.nansum(np.clip(arr, 0.0, None)))))
+
+    total_population = max(int(total_population), 0)
+
+    if w.sum() <= 0:
+        # fallback to area weights
+        metric_crs = b.estimate_utm_crs()
+        area = b.to_crs(metric_crs).geometry.area.values.astype(float)
+        area[~np.isfinite(area)] = 0.0
+        w = np.clip(area, 0.0, None)
+
+    if w.sum() <= 0:
+        w = np.ones(len(b), dtype=float)
+
+    scaled = (w / w.sum()) * float(total_population)
+    b[out_col] = _round_preserve_total(scaled, total=total_population)
+    b[f"{out_col}_weight"] = np.where(total_population > 0, b[out_col].astype(float) / float(total_population), 0.0)
+    return b
+
+
+def allocate_population_hybrid(
+    buildings: gpd.GeoDataFrame,
+    *,
+    pop_features: Optional[gpd.GeoDataFrame] = None,
+    pop_raster_src=None,
+    pop_col: Optional[str] = None,
+    building_id_col: str = "building_id",
+    out_col: str = "people",
+) -> Tuple[gpd.GeoDataFrame, str]:
+    """
+    Allocate population with preference order:
+      1) vector population features (if positive total)
+      2) raster population (if provided)
+
+    Returns (buildings_with_people, allocation_method).
+    """
+    if pop_features is not None and len(pop_features) > 0:
+        try:
+            inferred = pop_col or _infer_population_column(pop_features)
+            pop_sum = float(pd.to_numeric(pop_features[inferred], errors="coerce").fillna(0).clip(lower=0).sum())
+            if pop_sum > 0:
+                return (
+                    allocate_population_to_buildings(
+                        buildings,
+                        pop_features,
+                        pop_col=inferred,
+                        building_id_col=building_id_col,
+                        out_col=out_col,
+                    ),
+                    f"vector:{inferred}",
+                )
+        except Exception:
+            pass
+
+    if pop_raster_src is not None:
+        return (
+            allocate_population_from_raster_to_buildings(
+                buildings,
+                pop_raster_src,
+                building_id_col=building_id_col,
+                out_col=out_col,
+            ),
+            "raster",
+        )
+
+    raise ValueError("No usable population source provided (vector with positive totals or raster)")
+
 def weighted_distance_percentiles_people(
     b_dist: gpd.GeoDataFrame,
     dist_col: str = "dist_to_evac_m",
@@ -731,6 +1015,127 @@ def run_one_realization(
 
         # Percentiles
         **dist_pct,
+    }
+
+
+def run_one_realization_detailed(
+    G: nx.MultiDiGraph,
+    buildings: gpd.GeoDataFrame,
+    source_node: Any,
+    exit_nodes: Sequence[Any],
+    params: SimulationParams,
+    rng: np.random.Generator,
+    building_weight_mode: str = "uniform",
+    building_weight_col: Optional[str] = None,
+    people_col: str = "people",
+) -> Dict[str, Any]:
+    """
+    Run one realization and return both metrics and export-ready details.
+
+    Returns keys:
+      - metrics: dict
+      - failed_edges: pd.DataFrame
+      - routes: list[list[node]]
+      - evac_edges: pd.DataFrame
+      - buildings: GeoDataFrame (with people + dist_to_evac_m)
+    """
+    failed = sample_failed_edges(G, params.month, params.failure, rng)
+    H = graph_without_failed_edges(G, failed, copy_graph=True)
+
+    routes = routes_for_trucks(
+        H,
+        source_node=source_node,
+        exit_nodes=exit_nodes,
+        n_trucks=params.n_trucks,
+        weight=params.route_weight,
+        rng=rng,
+        strategy="round_robin",
+    )
+
+    evac_edges = node_paths_to_edge_keys(H, routes)
+    evac_lines = evac_edges_to_geoseries(H, evac_edges, crs="EPSG:4326")
+
+    if people_col in buildings.columns:
+        b_people = buildings.copy()
+    else:
+        b_people = assign_people_to_buildings(
+            buildings,
+            n_people=params.n_people,
+            rng=rng,
+            weight=building_weight_mode,
+            weight_col=building_weight_col,
+        )
+
+    b_dist = compute_building_distance_to_evac_paths(
+        b_people,
+        evac_lines,
+        metric_crs=None,
+        use_centroids=True,
+    )
+
+    # Build metrics from the already-sampled realization (no re-sampling).
+    evac_edges_count = int(len(evac_edges))
+    evac_total_length_m = 0.0
+    for (u, v, k) in evac_edges:
+        try:
+            L = H.edges[u, v, k].get("length", 0.0)
+            evac_total_length_m += float(L)
+        except Exception:
+            pass
+
+    n_routes_found = int(sum(1 for r in routes if r is not None))
+    frac_routes_found = float(n_routes_found / params.n_trucks) if params.n_trucks else 0.0
+    reached_exits = {r[-1] for r in routes if r is not None and len(r) > 0}
+    n_exits = int(len(exit_nodes))
+    n_exits_reached = int(sum(1 for e in exit_nodes if e in reached_exits))
+    frac_exits_reached = float(n_exits_reached / n_exits) if n_exits else 0.0
+
+    mets = accessibility_metrics(b_dist, radius_m=params.access_radius_m, people_col=people_col)
+    dist_pct = weighted_percentiles_people_distance(
+        b_dist,
+        dist_col="dist_to_evac_m",
+        w_col=people_col,
+        ps=(0.50, 0.75, 0.90, 0.95),
+    )
+
+    metrics = {
+        "month": params.month,
+        "n_edges_total": int(H.number_of_edges()),
+        "n_failed_edges": int(len(failed)),
+        "n_trucks": int(params.n_trucks),
+        "n_routes_found": n_routes_found,
+        "frac_routes_found": frac_routes_found,
+        "evac_edges_count": evac_edges_count,
+        "evac_total_length_m": float(evac_total_length_m),
+        "n_exits": n_exits,
+        "n_exits_reached": n_exits_reached,
+        "frac_exits_reached": frac_exits_reached,
+        **mets,
+        **dist_pct,
+    }
+
+    failed_rows = []
+    for u, v, k in sorted(failed):
+        d = G.edges[u, v, k] if k is not None and G.has_edge(u, v, k) else {}
+        failed_rows.append(
+            {
+                "u": u,
+                "v": v,
+                "key": k,
+                "length": d.get("length"),
+                f"p_hazard_{params.month}": d.get(f"p_hazard_{params.month}"),
+                f"p_buffer_hazard_{params.month}": d.get(f"p_buffer_hazard_{params.month}"),
+            }
+        )
+
+    evac_rows = [{"u": u, "v": v, "key": k} for (u, v, k) in sorted(evac_edges)]
+
+    return {
+        "metrics": metrics,
+        "failed_edges": pd.DataFrame(failed_rows),
+        "routes": routes,
+        "evac_edges": pd.DataFrame(evac_rows),
+        "buildings": b_dist,
     }
 
 
