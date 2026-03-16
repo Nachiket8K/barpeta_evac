@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Barpeta Flood Evacuation Viewer</title>
+
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+
+  <style>
+    html, body { margin: 0; height: 100%; }
+    #app { display: grid; grid-template-columns: 360px 1fr; height: 100%; }
+    #sidebar {
+      border-right: 1px solid #ddd;
+      padding: 12px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      overflow-y: auto;
+      background: #fafafa;
+    }
+    #map { height: 100%; }
+    .row { margin-bottom: 12px; }
+    label { display: block; font-size: 12px; opacity: 0.75; margin-bottom: 4px; }
+    select, input[type="range"], button { width: 100%; }
+    .inline { display: flex; gap: 8px; }
+    .inline > * { flex: 1; }
+    .legend { font-size: 13px; }
+    .chip { display: inline-block; width: 12px; height: 12px; margin-right: 6px; border-radius: 2px; vertical-align: middle; }
+    code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <h3 style="margin:0 0 12px 0;">Barpeta Flood-Evac Viewer</h3>
+
+    <div class="row">
+      <label>Scenario (seed)</label>
+      <select id="scenarioSelect"></select>
+      <small id="scenarioInfo"></small>
+    </div>
+
+    <div class="row">
+      <label>Frame date</label>
+      <input id="timeSlider" type="range" min="0" max="0" step="1" value="0" />
+      <small id="timeLabel">frame 0</small>
+    </div>
+
+    <div class="row inline">
+      <button id="playBtn">Play</button>
+      <button id="pauseBtn">Pause</button>
+    </div>
+
+    <div class="row">
+      <label>Playback speed</label>
+      <select id="speedSelect">
+        <option value="1000">Slow</option>
+        <option value="600" selected>Normal</option>
+        <option value="300">Fast</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label>Water mask opacity</label>
+      <input id="opacity" type="range" min="0" max="1" step="0.05" value="0.65" />
+      <small id="opacityLabel">0.65</small>
+    </div>
+
+    <div class="row">
+      <label>Layer visibility</label>
+      <div><input type="checkbox" id="chkWater" checked /> Water mask</div>
+      <div><input type="checkbox" id="chkRoads" checked /> Roads (intact)</div>
+      <div><input type="checkbox" id="chkFailed" checked /> Damaged roads</div>
+      <div><input type="checkbox" id="chkEvac" checked /> Evacuation paths</div>
+    </div>
+
+    <div class="row legend">
+      <div><span class="chip" style="background:#419bdf"></span>Water rise (May → Oct)</div>
+      <div><span class="chip" style="background:#111"></span>Roads (intact)</div>
+      <div><span class="chip" style="background:#d62728"></span>Roads (damaged)</div>
+      <div><span class="chip" style="background:#2ca02c"></span>Evacuation paths</div>
+    </div>
+
+    <hr />
+    <small>
+      Static GitHub Pages viewer. Data loaded from <code>docs/scenarios/</code>.
+    </small>
+  </div>
+
+  <div id="map"></div>
+</div>
+
+<script>
+  let map = null;
+  let indexData = null;
+  let manifest = null;
+  let currentScenario = null;
+  let timer = null;
+
+  const scenarioSelect = document.getElementById("scenarioSelect");
+  const scenarioInfo = document.getElementById("scenarioInfo");
+  const timeSlider = document.getElementById("timeSlider");
+  const timeLabel = document.getElementById("timeLabel");
+  const opacity = document.getElementById("opacity");
+  const opacityLabel = document.getElementById("opacityLabel");
+  const speedSelect = document.getElementById("speedSelect");
+
+  const chkWater = document.getElementById("chkWater");
+  const chkRoads = document.getElementById("chkRoads");
+  const chkFailed = document.getElementById("chkFailed");
+  const chkEvac = document.getElementById("chkEvac");
+
+  const SRC_WATER = "water-image";
+  const LYR_WATER = "water-layer";
+  const SRC_ROADS = "roads-base";
+  const LYR_ROADS = "roads-base-layer";
+  const SRC_FAILED = "roads-failed";
+  const LYR_FAILED = "roads-failed-layer";
+  const SRC_EVAC = "evac-paths";
+  const LYR_EVAC = "evac-paths-layer";
+
+  function fmtFramePath(template, frameIndex) {
+    return template.replace("{frame:04d}", String(frameIndex).padStart(4, "0"));
+  }
+
+  function scenarioBaseDir(pathToManifest) {
+    return pathToManifest.replace(/manifest\.json$/i, "");
+  }
+
+  function ensureMap(bounds) {
+    if (map) return;
+    const center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2];
+    map = new maplibregl.Map({
+      container: "map",
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: "raster",
+            tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+            tileSize: 256,
+            attribution: "© OpenStreetMap contributors"
+          }
+        },
+        layers: [{ id: "osm", type: "raster", source: "osm" }]
+      },
+      center,
+      zoom: 9
+    });
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+  }
+
+  function setLayerVisibility(layerId, visible) {
+    if (!map || !map.getLayer(layerId)) return;
+    map.setLayoutProperty(layerId, "visibility", visible ? "visible" : "none");
+  }
+
+  function updateVisibility() {
+    setLayerVisibility(LYR_WATER, chkWater.checked);
+    setLayerVisibility(LYR_ROADS, chkRoads.checked);
+    setLayerVisibility(LYR_FAILED, chkFailed.checked);
+    setLayerVisibility(LYR_EVAC, chkEvac.checked);
+  }
+
+  function updateWaterFrame(frameIdx) {
+    if (!map || !manifest || !currentScenario) return;
+    const wm = manifest.layers?.water_mask;
+    if (!wm) return;
+    const base = scenarioBaseDir(currentScenario.path);
+    const rel = fmtFramePath(wm.frame_path_template, frameIdx);
+    const url = `${base}${rel}`;
+    const b = wm.bounds_wgs84 || manifest.aoi?.bounds_wgs84;
+    if (!b || b.length !== 4) return;
+
+    const coords = [
+      [b[0], b[3]], [b[2], b[3]], [b[2], b[1]], [b[0], b[1]]
+    ];
+
+    if (!map.getSource(SRC_WATER)) {
+      map.addSource(SRC_WATER, { type: "image", url, coordinates: coords });
+      map.addLayer({
+        id: LYR_WATER,
+        type: "raster",
+        source: SRC_WATER,
+        paint: { "raster-opacity": parseFloat(opacity.value) }
+      });
+    } else {
+      map.getSource(SRC_WATER).updateImage({ url, coordinates: coords });
+    }
+  }
+
+  function updateTimeLabel(frameIdx) {
+    const dates = manifest?.time?.frame_dates || [];
+    const d = dates[frameIdx] || `frame ${frameIdx}`;
+    timeLabel.textContent = `frame ${frameIdx} | ${d}`;
+  }
+
+  function onTimeChange() {
+    const idx = parseInt(timeSlider.value, 10) || 0;
+    updateWaterFrame(idx);
+    updateTimeLabel(idx);
+  }
+
+  async function loadVectorLayer(sourceId, layerId, url, color, width) {
+    if (map.getLayer(layerId)) map.removeLayer(layerId);
+    if (map.getSource(sourceId)) map.removeSource(sourceId);
+    map.addSource(sourceId, { type: "geojson", data: url });
+    map.addLayer({
+      id: layerId,
+      type: "line",
+      source: sourceId,
+      paint: {
+        "line-color": color,
+        "line-width": width,
+        "line-opacity": 0.95
+      }
+    });
+  }
+
+  async function loadScenario(scenarioEntry) {
+    currentScenario = scenarioEntry;
+    const res = await fetch(scenarioEntry.path);
+    manifest = await res.json();
+
+    const bounds = manifest.aoi?.bounds_wgs84;
+    if (!bounds) throw new Error("Scenario manifest missing aoi.bounds_wgs84");
+    ensureMap(bounds);
+
+    await new Promise((resolve) => {
+      if (map.loaded()) return resolve();
+      map.once("load", resolve);
+    });
+
+    map.fitBounds([[bounds[0], bounds[1]], [bounds[2], bounds[3]]], { padding: 20 });
+
+    const nFrames = parseInt(manifest.time?.n_frames || 1, 10);
+    timeSlider.max = String(Math.max(nFrames - 1, 0));
+    timeSlider.value = "0";
+
+    const base = scenarioBaseDir(scenarioEntry.path);
+    const assets = manifest.assets || {};
+
+    if (assets.roads_base) {
+      await loadVectorLayer(SRC_ROADS, LYR_ROADS, `${base}${assets.roads_base}`, "#111111", 1.3);
+    }
+    if (assets.roads_failed) {
+      await loadVectorLayer(SRC_FAILED, LYR_FAILED, `${base}${assets.roads_failed}`, "#d62728", 2.4);
+    }
+    if (assets.evac_paths) {
+      await loadVectorLayer(SRC_EVAC, LYR_EVAC, `${base}${assets.evac_paths}`, "#2ca02c", 2.8);
+    }
+
+    scenarioInfo.textContent = JSON.stringify(manifest.parameters || {}, null, 0);
+    onTimeChange();
+    updateVisibility();
+  }
+
+  function stopPlayback() {
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  function startPlayback() {
+    stopPlayback();
+    const interval = parseInt(speedSelect.value, 10);
+    timer = setInterval(() => {
+      const max = parseInt(timeSlider.max, 10);
+      let v = parseInt(timeSlider.value, 10);
+      v = (v + 1 > max) ? 0 : v + 1;
+      timeSlider.value = String(v);
+      onTimeChange();
+    }, interval);
+  }
+
+  async function bootstrap() {
+    const res = await fetch("scenarios/index.json");
+    indexData = await res.json();
+    const scenarios = indexData.scenarios || [];
+    if (!scenarios.length) {
+      scenarioInfo.textContent = "No scenarios found in docs/scenarios/index.json";
+      return;
+    }
+
+    scenarioSelect.innerHTML = "";
+    scenarios.forEach((s) => {
+      const opt = document.createElement("option");
+      opt.value = s.scenario_id;
+      opt.textContent = s.scenario_id;
+      scenarioSelect.appendChild(opt);
+    });
+
+    await loadScenario(scenarios[0]);
+
+    scenarioSelect.addEventListener("change", async () => {
+      stopPlayback();
+      const sel = scenarios.find((s) => s.scenario_id === scenarioSelect.value);
+      if (sel) await loadScenario(sel);
+    });
+
+    timeSlider.addEventListener("input", onTimeChange);
+    opacity.addEventListener("input", () => {
+      opacityLabel.textContent = parseFloat(opacity.value).toFixed(2);
+      if (map && map.getLayer(LYR_WATER)) {
+        map.setPaintProperty(LYR_WATER, "raster-opacity", parseFloat(opacity.value));
+      }
+    });
+    document.getElementById("playBtn").addEventListener("click", startPlayback);
+    document.getElementById("pauseBtn").addEventListener("click", stopPlayback);
+    chkWater.addEventListener("change", updateVisibility);
+    chkRoads.addEventListener("change", updateVisibility);
+    chkFailed.addEventListener("change", updateVisibility);
+    chkEvac.addEventListener("change", updateVisibility);
+  }
+
+  bootstrap().catch((err) => {
+    console.error(err);
+    scenarioInfo.textContent = `Failed to load viewer: ${err.message}`;
+  });
+</script>
+</body>
+</html>

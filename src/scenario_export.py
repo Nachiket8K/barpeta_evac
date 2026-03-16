@@ -17,6 +17,7 @@ import shutil
 
 import numpy as np
 import pandas as pd
+import geopandas as gpd
 from PIL import Image
 
 
@@ -43,6 +44,41 @@ def write_csv(path: Path, df: pd.DataFrame) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
     return path
+
+
+def write_geojson(path: Path, gdf: gpd.GeoDataFrame) -> Path:
+    """
+    Write GeoDataFrame as GeoJSON using in-process JSON serialization.
+    (Avoids dependence on external Fiona/GDAL write drivers.)
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = gdf.to_json(drop_id=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def edge_keys_to_geodataframe(
+    edges_gdf: gpd.GeoDataFrame,
+    keys_df: pd.DataFrame,
+    *,
+    key_cols: Tuple[str, str, str] = ("u", "v", "key"),
+) -> gpd.GeoDataFrame:
+    """
+    Subset edge GeoDataFrame by (u, v, key) table using type-agnostic matching.
+    """
+    u_col, v_col, k_col = key_cols
+    if any(c not in edges_gdf.columns for c in key_cols):
+        raise KeyError(f"edges_gdf must contain {key_cols}")
+    if any(c not in keys_df.columns for c in key_cols):
+        raise KeyError(f"keys_df must contain {key_cols}")
+
+    e = edges_gdf.copy()
+    k = keys_df.copy()
+    e["_edge_key"] = e[u_col].astype(str) + "|" + e[v_col].astype(str) + "|" + e[k_col].astype(str)
+    k["_edge_key"] = k[u_col].astype(str) + "|" + k[v_col].astype(str) + "|" + k[k_col].astype(str)
+    keep = set(k["_edge_key"].tolist())
+    out = e[e["_edge_key"].isin(keep)].copy()
+    return out.drop(columns=["_edge_key"])
 
 
 def write_png_mask_rgba(
@@ -99,6 +135,9 @@ def build_manifest(
     parameters: Dict[str, Any],
     assets: Optional[Dict[str, Any]] = None,
     aoi_bounds_wgs84: Optional[Sequence[float]] = None,
+    overlay_bounds_wgs84: Optional[Sequence[float]] = None,
+    frame_dates: Optional[Sequence[str]] = None,
+    vector_layers: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Build a Kivu-style manifest payload.
@@ -118,6 +157,15 @@ def build_manifest(
             }
         },
     }
+    if frame_dates is not None:
+        payload["time"]["frame_dates"] = list(frame_dates)
+
+    if overlay_bounds_wgs84 is not None:
+        payload["layers"]["water_mask"]["bounds_wgs84"] = list(overlay_bounds_wgs84)
+
+    if vector_layers:
+        payload["layers"].update(vector_layers)
+
     if assets:
         payload["assets"] = assets
     if aoi_bounds_wgs84 is not None:
@@ -154,3 +202,103 @@ def update_index_json(
             opts[k] = sorted(current)
 
     return write_json(index_path, payload)
+
+
+def _build_frame_dates(start_date: str, end_date: str, n_frames: int) -> List[str]:
+    """
+    Construct frame date labels aligned with weekly cadence when possible.
+    """
+    if n_frames <= 0:
+        return []
+
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    dates = pd.date_range(start, end, freq="7D")
+    if len(dates) == 0 or dates[-1] != end:
+        dates = dates.append(pd.DatetimeIndex([end]))
+
+    if len(dates) != int(n_frames):
+        dates = pd.date_range(start, end, periods=int(n_frames))
+
+    return [str(pd.Timestamp(d).date()) for d in dates]
+
+
+def add_vector_overlays_to_scenario_bundle(
+    scenario_dir: Path,
+    edges_gdf: gpd.GeoDataFrame,
+) -> Path:
+    """
+    Add roads/failed/evac GeoJSON overlays and enrich manifest in an existing scenario bundle.
+    """
+    manifest_path = scenario_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing manifest in {scenario_dir}")
+
+    with manifest_path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    roads_base = edges_gdf[[c for c in ["u", "v", "key", "geometry"] if c in edges_gdf.columns]].copy()
+    if roads_base.crs is None:
+        roads_base = roads_base.set_crs("EPSG:4326")
+    else:
+        roads_base = roads_base.to_crs("EPSG:4326")
+    roads_base["status"] = "intact"
+
+    failed_csv = scenario_dir / "failed_edges.csv"
+    evac_csv = scenario_dir / "evac_edges.csv"
+
+    failed_df = pd.read_csv(failed_csv) if failed_csv.exists() else pd.DataFrame(columns=["u", "v", "key"])
+    evac_df = pd.read_csv(evac_csv) if evac_csv.exists() else pd.DataFrame(columns=["u", "v", "key"])
+
+    failed_keys = failed_df[[c for c in ["u", "v", "key"] if c in failed_df.columns]].copy()
+    evac_keys = evac_df[[c for c in ["u", "v", "key"] if c in evac_df.columns]].copy()
+
+    if len(failed_keys) > 0:
+        roads_failed = edge_keys_to_geodataframe(roads_base, failed_keys)
+    else:
+        roads_failed = roads_base.iloc[0:0].copy()
+    roads_failed["status"] = "failed"
+
+    if len(evac_keys) > 0:
+        evac_paths = edge_keys_to_geodataframe(roads_base, evac_keys)
+    else:
+        evac_paths = roads_base.iloc[0:0].copy()
+    evac_paths["status"] = "evac"
+
+    write_geojson(scenario_dir / "roads_base.geojson", roads_base[["u", "v", "key", "status", "geometry"]])
+    write_geojson(scenario_dir / "roads_failed.geojson", roads_failed[["u", "v", "key", "status", "geometry"]])
+    write_geojson(scenario_dir / "evac_paths.geojson", evac_paths[["u", "v", "key", "status", "geometry"]])
+
+    assets = manifest.setdefault("assets", {})
+    assets["roads_base"] = "roads_base.geojson"
+    assets["roads_failed"] = "roads_failed.geojson"
+    assets["evac_paths"] = "evac_paths.geojson"
+
+    layers = manifest.setdefault("layers", {})
+    layers["roads_base"] = {"type": "line", "asset": "roads_base.geojson", "color": "#111111"}
+    layers["roads_failed"] = {"type": "line", "asset": "roads_failed.geojson", "color": "#d62728"}
+    layers["evac_paths"] = {"type": "line", "asset": "evac_paths.geojson", "color": "#2ca02c"}
+
+    water = layers.setdefault("water_mask", {})
+    if "bounds_wgs84" not in water and "aoi" in manifest and "bounds_wgs84" in manifest["aoi"]:
+        water["bounds_wgs84"] = list(manifest["aoi"]["bounds_wgs84"])
+
+    t = manifest.setdefault("time", {})
+    if "frame_dates" not in t and all(k in t for k in ["start", "end", "n_frames"]):
+        t["frame_dates"] = _build_frame_dates(t["start"], t["end"], int(t["n_frames"]))
+
+    return write_json(manifest_path, manifest)
+
+
+def add_vector_overlays_to_all_scenarios(
+    scenarios_root: Path,
+    edges_gdf: gpd.GeoDataFrame,
+) -> List[Path]:
+    """
+    Enrich all scenario bundles under docs/scenarios with vector overlays.
+    """
+    updated: List[Path] = []
+    for d in sorted(scenarios_root.iterdir()):
+        if d.is_dir() and (d / "manifest.json").exists():
+            updated.append(add_vector_overlays_to_scenario_bundle(d, edges_gdf))
+    return updated
