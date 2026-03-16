@@ -1,0 +1,39 @@
+{
+  "scenario_id": "barpeta_oct_seed_101",
+  "time": {
+    "start": "2025-05-01",
+    "end": "2025-10-31",
+    "n_frames": 28
+  },
+  "parameters": {
+    "seed": 101,
+    "damage_month": "oct",
+    "access_radius_m": 1000.0,
+    "water_over_threshold": 0.95,
+    "p_background": 0.02,
+    "mask_dem_weight": 0.25,
+    "mask_threshold": 0.5,
+    "population_allocation_method": "vector:popthresh"
+  },
+  "layers": {
+    "water_mask": {
+      "frame_path_template": "frames/water_mask/t{frame:04d}.png",
+      "frame_count": 28
+    }
+  },
+  "assets": {
+    "metrics": "metrics.json",
+    "failed_edges": "failed_edges.csv",
+    "evac_edges": "evac_edges.csv",
+    "routes": "routes.json",
+    "buildings_access": "buildings_access.csv"
+  },
+  "aoi": {
+    "bounds_wgs84": [
+      90.65321740233628,
+      26.089680965154855,
+      91.2900331072486,
+      26.66541123074705
+    ]
+  }
+}
