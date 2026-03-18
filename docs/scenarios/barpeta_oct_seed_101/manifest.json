@@ -3,7 +3,37 @@
   "time": {
     "start": "2025-05-01",
     "end": "2025-10-31",
-    "n_frames": 28
+    "n_frames": 28,
+    "frame_dates": [
+      "2025-05-01",
+      "2025-05-08",
+      "2025-05-15",
+      "2025-05-22",
+      "2025-05-29",
+      "2025-06-05",
+      "2025-06-12",
+      "2025-06-19",
+      "2025-06-26",
+      "2025-07-03",
+      "2025-07-10",
+      "2025-07-17",
+      "2025-07-24",
+      "2025-07-31",
+      "2025-08-07",
+      "2025-08-14",
+      "2025-08-21",
+      "2025-08-28",
+      "2025-09-04",
+      "2025-09-11",
+      "2025-09-18",
+      "2025-09-25",
+      "2025-10-02",
+      "2025-10-09",
+      "2025-10-16",
+      "2025-10-23",
+      "2025-10-30",
+      "2025-10-31"
+    ]
   },
   "parameters": {
     "seed": 101,
@@ -18,7 +48,28 @@
   "layers": {
     "water_mask": {
       "frame_path_template": "frames/water_mask/t{frame:04d}.png",
-      "frame_count": 28
+      "frame_count": 28,
+      "bounds_wgs84": [
+        90.65321740233628,
+        26.089680965154855,
+        91.2900331072486,
+        26.66541123074705
+      ]
+    },
+    "roads_base": {
+      "type": "line",
+      "asset": "roads_base.geojson",
+      "color": "#111111"
+    },
+    "roads_failed": {
+      "type": "line",
+      "asset": "roads_failed.geojson",
+      "color": "#d62728"
+    },
+    "evac_paths": {
+      "type": "line",
+      "asset": "evac_paths.geojson",
+      "color": "#2ca02c"
     }
   },
   "assets": {
@@ -26,7 +77,10 @@
     "failed_edges": "failed_edges.csv",
     "evac_edges": "evac_edges.csv",
     "routes": "routes.json",
-    "buildings_access": "buildings_access.csv"
+    "buildings_access": "buildings_access.csv",
+    "roads_base": "roads_base.geojson",
+    "roads_failed": "roads_failed.geojson",
+    "evac_paths": "evac_paths.geojson"
   },
   "aoi": {
     "bounds_wgs84": [
