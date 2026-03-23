@@ -513,6 +513,10 @@ def _infer_population_column(pop_features: gpd.GeoDataFrame) -> str:
         "population",
         "pop",
         "pop_total",
+        "pop_mean",
+        "pop_median",
+        "pop_lower",
+        "pop_upper",
         "value",
         "count",
         "dn",
@@ -524,6 +528,22 @@ def _infer_population_column(pop_features: gpd.GeoDataFrame) -> str:
         if p in lower_map:
             return lower_map[p]
 
+    # Avoid selecting obvious metadata/extent fields when population-like names are absent.
+    blocked_substrings = {
+        "left",
+        "right",
+        "top",
+        "bottom",
+        "thresh",
+        "threshold",
+        "lat",
+        "lon",
+        "confidence",
+        "index",
+        "fid",
+        "id",
+    }
+
     numeric_cols = [
         c for c in pop_features.columns
         if c != "geometry" and pd.api.types.is_numeric_dtype(pop_features[c])
@@ -531,10 +551,17 @@ def _infer_population_column(pop_features: gpd.GeoDataFrame) -> str:
     if not numeric_cols:
         raise ValueError("Could not infer population column from population features")
 
+    filtered_numeric_cols = [
+        c
+        for c in numeric_cols
+        if not any(tok in c.lower() for tok in blocked_substrings)
+    ]
+    candidate_cols = filtered_numeric_cols if filtered_numeric_cols else numeric_cols
+
     # Choose the numeric column with largest positive sum.
     sums = {
         c: float(pd.to_numeric(pop_features[c], errors="coerce").fillna(0).clip(lower=0).sum())
-        for c in numeric_cols
+        for c in candidate_cols
     }
     return max(sums, key=sums.get)
 
@@ -668,7 +695,8 @@ def allocate_population_from_raster_to_buildings(
     if b.crs is None or pop_raster_src.crs is None:
         raise ValueError("Buildings and population raster must have CRS")
 
-    pts = b.to_crs(pop_raster_src.crs).geometry.centroid
+    pts = b.geometry.representative_point()
+    pts = gpd.GeoSeries(pts, crs=b.crs).to_crs(pop_raster_src.crs)
     coords = [(float(p.x), float(p.y)) if p is not None and not p.is_empty else (np.nan, np.nan) for p in pts]
 
     vals = []
@@ -687,7 +715,13 @@ def allocate_population_from_raster_to_buildings(
     w = np.clip(w, 0.0, None)
 
     if total_population is None:
-        arr = pop_raster_src.read(1).astype(float)
+        # Estimate total population within the building AOI (not whole-country raster).
+        from rasterio.windows import from_bounds
+
+        b_r = b.to_crs(pop_raster_src.crs)
+        minx, miny, maxx, maxy = [float(v) for v in b_r.total_bounds]
+        window = from_bounds(minx, miny, maxx, maxy, transform=pop_raster_src.transform)
+        arr = pop_raster_src.read(1, window=window, boundless=True, fill_value=np.nan).astype(float)
         nd = pop_raster_src.nodata
         if nd is not None:
             arr[arr == float(nd)] = np.nan

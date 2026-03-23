@@ -70,6 +70,13 @@
       "type": "line",
       "asset": "evac_paths.geojson",
       "color": "#2ca02c"
+    },
+    "buildings_access": {
+      "type": "circle",
+      "asset": "buildings_access_chunks",
+      "radius": 2.0,
+      "color_ok": "#2ca02c",
+      "color_bad": "#d62728"
     }
   },
   "assets": {
@@ -80,7 +87,19 @@
     "buildings_access": "buildings_access.csv",
     "roads_base": "roads_base.geojson",
     "roads_failed": "roads_failed.geojson",
-    "evac_paths": "evac_paths.geojson"
+    "evac_paths": "evac_paths.geojson",
+    "buildings_access_chunks": [
+      "buildings_access_part1.geojson",
+      "buildings_access_part2.geojson"
+    ],
+    "buildings_access_format": "geojson",
+    "buildings_access_summary": {
+      "feature_count": 785457,
+      "people_total": 100,
+      "chunk_count": 2,
+      "include_zero_people": true
+    },
+    "admin_boundary": "admin_boundary.geojson"
   },
   "aoi": {
     "bounds_wgs84": [

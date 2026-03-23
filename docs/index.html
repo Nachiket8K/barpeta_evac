@@ -27,6 +27,8 @@
     .legend { font-size: 13px; }
     .chip { display: inline-block; width: 12px; height: 12px; margin-right: 6px; border-radius: 2px; vertical-align: middle; }
     code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }
+    .kpi { background:#fff; border:1px solid #e6e6e6; border-radius:6px; padding:8px; margin-top:6px; }
+    .kpi b { font-size: 14px; }
   </style>
 </head>
 <body>
@@ -67,11 +69,33 @@
     </div>
 
     <div class="row">
+      <label>Basemap style</label>
+      <select id="baseSelect">
+        <option value="maplibre" selected>MapLibre (OSM)</option>
+        <option value="admin">Administrative boundaries</option>
+      </select>
+    </div>
+
+    <div class="row">
       <label>Layer visibility</label>
       <div><input type="checkbox" id="chkWater" checked /> Water mask</div>
       <div><input type="checkbox" id="chkRoads" checked /> Roads (intact)</div>
       <div><input type="checkbox" id="chkFailed" checked /> Damaged roads</div>
       <div><input type="checkbox" id="chkEvac" checked /> Evacuation paths</div>
+      <div><input type="checkbox" id="chkBuildings" checked /> Buildings accessibility</div>
+    </div>
+
+    <div class="row">
+      <label>Accessibility threshold (m)</label>
+      <input id="accessThreshold" type="range" min="100" max="5000" step="50" value="1000" />
+      <small id="accessThresholdLabel">1000 m</small>
+    </div>
+
+    <div class="row">
+      <label>Flood impact (people)</label>
+      <div class="kpi">Total represented: <b id="kpiTotal">-</b></div>
+      <div class="kpi">Accessible (≤ threshold): <b id="kpiAccessible">-</b></div>
+      <div class="kpi">Affected (> threshold): <b id="kpiAffected">-</b> <span id="kpiAffectedPct"></span></div>
     </div>
 
     <div class="row legend">
@@ -79,6 +103,8 @@
       <div><span class="chip" style="background:#111"></span>Roads (intact)</div>
       <div><span class="chip" style="background:#d62728"></span>Roads (damaged)</div>
       <div><span class="chip" style="background:#2ca02c"></span>Evacuation paths</div>
+      <div><span class="chip" style="background:#2ca02c"></span>Buildings accessible</div>
+      <div><span class="chip" style="background:#d62728"></span>Buildings affected</div>
     </div>
 
     <hr />
@@ -104,11 +130,21 @@
   const opacity = document.getElementById("opacity");
   const opacityLabel = document.getElementById("opacityLabel");
   const speedSelect = document.getElementById("speedSelect");
+  const baseSelect = document.getElementById("baseSelect");
 
   const chkWater = document.getElementById("chkWater");
   const chkRoads = document.getElementById("chkRoads");
   const chkFailed = document.getElementById("chkFailed");
   const chkEvac = document.getElementById("chkEvac");
+  const chkBuildings = document.getElementById("chkBuildings");
+
+  const accessThreshold = document.getElementById("accessThreshold");
+  const accessThresholdLabel = document.getElementById("accessThresholdLabel");
+
+  const kpiTotal = document.getElementById("kpiTotal");
+  const kpiAccessible = document.getElementById("kpiAccessible");
+  const kpiAffected = document.getElementById("kpiAffected");
+  const kpiAffectedPct = document.getElementById("kpiAffectedPct");
 
   const SRC_WATER = "water-image";
   const LYR_WATER = "water-layer";
@@ -118,6 +154,13 @@
   const LYR_FAILED = "roads-failed-layer";
   const SRC_EVAC = "evac-paths";
   const LYR_EVAC = "evac-paths-layer";
+  const SRC_BUILDINGS = "buildings-access";
+  const LYR_BUILDINGS = "buildings-access-layer";
+  const SRC_ADMIN = "admin-boundary";
+  const LYR_ADMIN = "admin-boundary-layer";
+
+  let buildingsFeatures = [];
+  let metricsData = null;
 
   function fmtFramePath(template, frameIndex) {
     return template.replace("{frame:04d}", String(frameIndex).padStart(4, "0"));
@@ -142,7 +185,10 @@
             attribution: "© OpenStreetMap contributors"
           }
         },
-        layers: [{ id: "osm", type: "raster", source: "osm" }]
+        layers: [
+          { id: "background", type: "background", paint: { "background-color": "#f8f8f8" } },
+          { id: "osm", type: "raster", source: "osm" }
+        ]
       },
       center,
       zoom: 9
@@ -160,6 +206,66 @@
     setLayerVisibility(LYR_ROADS, chkRoads.checked);
     setLayerVisibility(LYR_FAILED, chkFailed.checked);
     setLayerVisibility(LYR_EVAC, chkEvac.checked);
+    setLayerVisibility(LYR_BUILDINGS, chkBuildings.checked);
+    updateBasemapMode();
+  }
+
+  function updateBasemapMode() {
+    if (!map) return;
+    const isAdmin = baseSelect.value === "admin";
+    setLayerVisibility("osm", !isAdmin);
+    setLayerVisibility(LYR_ADMIN, isAdmin);
+  }
+
+  function formatInt(v) {
+    return Number.isFinite(v) ? Math.round(v).toLocaleString() : "-";
+  }
+
+  function applyBuildingThresholdStyle() {
+    if (!map || !map.getLayer(LYR_BUILDINGS)) return;
+    const thr = parseFloat(accessThreshold.value) || 0;
+    map.setPaintProperty(LYR_BUILDINGS, "circle-color", [
+      "case",
+      ["<=", ["to-number", ["get", "dist_to_evac_m"]], thr],
+      "#2ca02c",
+      "#d62728"
+    ]);
+  }
+
+  function updateAffectedKPIs() {
+    const thr = parseFloat(accessThreshold.value) || 0;
+    let total = 0;
+    let accessible = 0;
+
+    for (const f of buildingsFeatures) {
+      const p = Number(f?.properties?.people ?? 0);
+      const d = Number(f?.properties?.dist_to_evac_m ?? NaN);
+      if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(d)) continue;
+      total += p;
+      if (d <= thr) accessible += p;
+    }
+
+    let affected = total - accessible;
+    if (affected < 0) affected = 0;
+    const pct = total > 0 ? (affected / total) * 100 : null;
+
+    kpiTotal.textContent = formatInt(total);
+    kpiAccessible.textContent = formatInt(accessible);
+    kpiAffected.textContent = formatInt(affected);
+    kpiAffectedPct.textContent = pct === null ? "" : `(${pct.toFixed(1)}%)`;
+
+    if (!total && metricsData && Number.isFinite(Number(metricsData.n_people_allocated))) {
+      const alloc = Number(metricsData.n_people_allocated);
+      const accessFrac = Number(metricsData.access_frac);
+      if (Number.isFinite(accessFrac) && alloc > 0) {
+        const fallbackAccessible = Math.round(alloc * accessFrac);
+        const fallbackAffected = Math.max(0, alloc - fallbackAccessible);
+        kpiTotal.textContent = formatInt(alloc);
+        kpiAccessible.textContent = formatInt(fallbackAccessible);
+        kpiAffected.textContent = formatInt(fallbackAffected);
+        kpiAffectedPct.textContent = `(${((fallbackAffected / alloc) * 100).toFixed(1)}%)`;
+      }
+    }
   }
 
   function updateWaterFrame(frameIdx) {
@@ -217,6 +323,73 @@
     });
   }
 
+  async function loadAdminBoundary(base, assets) {
+    if (map.getLayer(LYR_ADMIN)) map.removeLayer(LYR_ADMIN);
+    if (map.getSource(SRC_ADMIN)) map.removeSource(SRC_ADMIN);
+    if (!assets.admin_boundary) return;
+    map.addSource(SRC_ADMIN, { type: "geojson", data: `${base}${assets.admin_boundary}` });
+    map.addLayer({
+      id: LYR_ADMIN,
+      type: "line",
+      source: SRC_ADMIN,
+      paint: {
+        "line-color": "#1f77b4",
+        "line-width": 2.0,
+        "line-opacity": 0.95
+      }
+    });
+  }
+
+  async function loadBuildingsLayer(base, assets) {
+    if (map.getLayer(LYR_BUILDINGS)) map.removeLayer(LYR_BUILDINGS);
+    if (map.getSource(SRC_BUILDINGS)) map.removeSource(SRC_BUILDINGS);
+    buildingsFeatures = [];
+
+    let chunkPaths = [];
+    if (Array.isArray(assets.buildings_access_chunks) && assets.buildings_access_chunks.length) {
+      chunkPaths = assets.buildings_access_chunks.map((r) => `${base}${r}`);
+    } else if (typeof assets.buildings_access === "string" && assets.buildings_access.endsWith(".geojson")) {
+      chunkPaths = [`${base}${assets.buildings_access}`];
+    }
+
+    if (!chunkPaths.length) {
+      updateAffectedKPIs();
+      return;
+    }
+
+    const payloads = await Promise.all(
+      chunkPaths.map(async (u) => {
+        const r = await fetch(u);
+        if (!r.ok) throw new Error(`Failed to load building chunk: ${u}`);
+        return r.json();
+      })
+    );
+
+    buildingsFeatures = payloads.flatMap((fc) => Array.isArray(fc?.features) ? fc.features : []);
+    const merged = { type: "FeatureCollection", features: buildingsFeatures };
+
+    map.addSource(SRC_BUILDINGS, { type: "geojson", data: merged });
+    map.addLayer({
+      id: LYR_BUILDINGS,
+      type: "circle",
+      source: SRC_BUILDINGS,
+      paint: {
+        "circle-radius": [
+          "interpolate", ["linear"], ["zoom"],
+          8, 1.3,
+          11, 2.5,
+          14, 4.0
+        ],
+        "circle-opacity": 0.82,
+        "circle-stroke-color": "#ffffff",
+        "circle-stroke-width": 0.25
+      }
+    });
+
+    applyBuildingThresholdStyle();
+    updateAffectedKPIs();
+  }
+
   async function loadScenario(scenarioEntry) {
     currentScenario = scenarioEntry;
     const res = await fetch(scenarioEntry.path);
@@ -240,6 +413,14 @@
     const base = scenarioBaseDir(scenarioEntry.path);
     const assets = manifest.assets || {};
 
+    metricsData = null;
+    if (assets.metrics) {
+      try {
+        const mres = await fetch(`${base}${assets.metrics}`);
+        if (mres.ok) metricsData = await mres.json();
+      } catch (_) {}
+    }
+
     if (assets.roads_base) {
       await loadVectorLayer(SRC_ROADS, LYR_ROADS, `${base}${assets.roads_base}`, "#111111", 1.3);
     }
@@ -249,9 +430,18 @@
     if (assets.evac_paths) {
       await loadVectorLayer(SRC_EVAC, LYR_EVAC, `${base}${assets.evac_paths}`, "#2ca02c", 2.8);
     }
+    await loadAdminBoundary(base, assets);
+    await loadBuildingsLayer(base, assets);
+
+    if (manifest.parameters && Number.isFinite(Number(manifest.parameters.access_radius_m))) {
+      accessThreshold.value = String(Math.round(Number(manifest.parameters.access_radius_m)));
+    }
+    accessThresholdLabel.textContent = `${accessThreshold.value} m`;
 
     scenarioInfo.textContent = JSON.stringify(manifest.parameters || {}, null, 0);
     onTimeChange();
+    applyBuildingThresholdStyle();
+    updateAffectedKPIs();
     updateVisibility();
   }
 
@@ -306,12 +496,19 @@
         map.setPaintProperty(LYR_WATER, "raster-opacity", parseFloat(opacity.value));
       }
     });
+    baseSelect.addEventListener("change", updateBasemapMode);
+    accessThreshold.addEventListener("input", () => {
+      accessThresholdLabel.textContent = `${accessThreshold.value} m`;
+      applyBuildingThresholdStyle();
+      updateAffectedKPIs();
+    });
     document.getElementById("playBtn").addEventListener("click", startPlayback);
     document.getElementById("pauseBtn").addEventListener("click", stopPlayback);
     chkWater.addEventListener("change", updateVisibility);
     chkRoads.addEventListener("change", updateVisibility);
     chkFailed.addEventListener("change", updateVisibility);
     chkEvac.addEventListener("change", updateVisibility);
+    chkBuildings.addEventListener("change", updateVisibility);
   }
 
   bootstrap().catch((err) => {

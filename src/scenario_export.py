@@ -1,7 +1,7 @@
 """
 Scenario export helpers for static GitHub Pages playback.
 
-This module writes Kivu-style artifacts:
+This module writes detailed artifacts:
   - docs/scenarios/index.json
   - docs/scenarios/<scenario_id>/manifest.json
   - docs/scenarios/<scenario_id>/frames/<layer>/t####.png
@@ -14,11 +14,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import json
 import shutil
+import math
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 from PIL import Image
+from shapely import wkt
+from shapely.geometry import box
 
 
 def ensure_dir(path: Path) -> Path:
@@ -55,6 +58,330 @@ def write_geojson(path: Path, gdf: gpd.GeoDataFrame) -> Path:
     text = gdf.to_json(drop_id=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _feature_json_size_estimate(
+    coords: Sequence[Tuple[float, float]],
+    props_df: pd.DataFrame,
+    *,
+    sample_n: int = 2000,
+    coord_precision: int = 6,
+) -> float:
+    """
+    Estimate average serialized bytes per GeoJSON feature from a sample.
+    """
+    n = len(coords)
+    if n == 0:
+        return 128.0
+
+    s_n = int(min(sample_n, n))
+    idx = np.linspace(0, n - 1, num=s_n).astype(int)
+
+    sizes: List[int] = []
+    for i in idx:
+        x, y = coords[i]
+        feat = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [round(float(x), coord_precision), round(float(y), coord_precision)],
+            },
+            "properties": {
+                "building_id": int(props_df.iloc[i]["building_id"]),
+                "people": int(props_df.iloc[i]["people"]),
+                "dist_to_evac_m": float(props_df.iloc[i]["dist_to_evac_m"]),
+            },
+        }
+        sizes.append(len(json.dumps(feat, separators=(",", ":"), ensure_ascii=False)))
+
+    return float(np.mean(sizes)) if sizes else 128.0
+
+
+def export_buildings_access_geojson_chunks(
+    scenario_dir: Path,
+    buildings: gpd.GeoDataFrame,
+    *,
+    people_col: str = "people",
+    dist_col: str = "dist_to_evac_m",
+    building_id_col: str = "building_id",
+    include_zero_people: bool = False,
+    max_chunk_size_mb: float = 95.0,
+    min_chunks_if_exceeds: int = 2,
+    coord_precision: int = 6,
+) -> Dict[str, Any]:
+    """
+    Export building accessibility as chunked GeoJSON Point layers for web rendering.
+
+    - Geometry is converted to representative points in EPSG:4326.
+    - Only required properties are retained: building_id, people, dist_to_evac_m.
+    - If estimated payload exceeds max_chunk_size_mb, split into multiple files
+      (at least `min_chunks_if_exceeds`, default 2).
+    """
+    if "geometry" not in buildings.columns:
+        raise ValueError("buildings must contain a geometry column")
+
+    b = buildings.copy()
+    if building_id_col not in b.columns:
+        b[building_id_col] = np.arange(len(b), dtype=int)
+
+    if people_col not in b.columns:
+        b[people_col] = 0
+    if dist_col not in b.columns:
+        b[dist_col] = np.nan
+
+    if not include_zero_people:
+        b = b[pd.to_numeric(b[people_col], errors="coerce").fillna(0).astype(float) > 0].copy()
+
+    if b.crs is None:
+        b = b.set_crs("EPSG:4326")
+    else:
+        b = b.to_crs("EPSG:4326")
+
+    b = b[np.isfinite(pd.to_numeric(b[dist_col], errors="coerce"))].copy()
+
+    out_files: List[str] = []
+    if len(b) == 0:
+        empty_name = "buildings_access_part1.geojson"
+        payload = {"type": "FeatureCollection", "features": []}
+        (scenario_dir / empty_name).write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        return {
+            "files": [empty_name],
+            "feature_count": 0,
+            "people_total": 0,
+            "chunk_count": 1,
+            "include_zero_people": bool(include_zero_people),
+        }
+
+    # Build minimal props and representative points.
+    rep_pts = b.geometry.representative_point()
+    coords = [(float(g.x), float(g.y)) for g in rep_pts]
+    props = pd.DataFrame(
+        {
+            "building_id": pd.to_numeric(b[building_id_col], errors="coerce").fillna(0).astype(np.int64),
+            "people": pd.to_numeric(b[people_col], errors="coerce").fillna(0).astype(np.int64),
+            "dist_to_evac_m": pd.to_numeric(b[dist_col], errors="coerce").fillna(np.nan).astype(float),
+        }
+    )
+
+    n = len(props)
+    avg_feature_bytes = _feature_json_size_estimate(coords, props, coord_precision=coord_precision)
+    estimated_total_bytes = avg_feature_bytes * float(n) + 64.0
+    max_bytes = float(max_chunk_size_mb) * 1024.0 * 1024.0
+
+    if estimated_total_bytes > max_bytes:
+        chunk_count = max(int(math.ceil(estimated_total_bytes / max_bytes)), int(min_chunks_if_exceeds))
+    else:
+        chunk_count = 1
+
+    while True:
+        # Clear existing parts from previous iteration.
+        for old in scenario_dir.glob("buildings_access_part*.geojson"):
+            old.unlink(missing_ok=True)
+
+        out_files = []
+        chunk_sizes: List[int] = []
+        rows_per_chunk = int(math.ceil(n / max(chunk_count, 1)))
+
+        for i in range(chunk_count):
+            start = i * rows_per_chunk
+            end = min((i + 1) * rows_per_chunk, n)
+            if start >= end:
+                break
+
+            feats = []
+            for j in range(start, end):
+                x, y = coords[j]
+                feats.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": [round(float(x), coord_precision), round(float(y), coord_precision)],
+                        },
+                        "properties": {
+                            "building_id": int(props.iloc[j]["building_id"]),
+                            "people": int(props.iloc[j]["people"]),
+                            "dist_to_evac_m": float(props.iloc[j]["dist_to_evac_m"]),
+                        },
+                    }
+                )
+
+            payload = {"type": "FeatureCollection", "features": feats}
+            name = f"buildings_access_part{i + 1}.geojson"
+            out_path = scenario_dir / name
+            out_path.write_text(
+                json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            out_files.append(name)
+            chunk_sizes.append(int(out_path.stat().st_size))
+
+        if not chunk_sizes:
+            break
+
+        if max(chunk_sizes) <= max_bytes or chunk_count >= n:
+            break
+
+        # Increase chunk count and rewrite until each part is under threshold.
+        chunk_count = min(int(chunk_count * 2), int(n))
+
+    return {
+        "files": out_files,
+        "feature_count": int(n),
+        "people_total": int(props["people"].sum()),
+        "chunk_count": int(len(out_files)),
+        "include_zero_people": bool(include_zero_people),
+        "estimated_total_mb": float(estimated_total_bytes / (1024.0 * 1024.0)),
+        "max_chunk_size_mb": float(max_chunk_size_mb),
+        "max_chunk_written_mb": float(max(chunk_sizes) / (1024.0 * 1024.0)) if 'chunk_sizes' in locals() and chunk_sizes else 0.0,
+    }
+
+
+def write_admin_boundary_geojson(
+    scenario_dir: Path,
+    *,
+    aoi_gdf: Optional[gpd.GeoDataFrame] = None,
+    aoi_bounds_wgs84: Optional[Sequence[float]] = None,
+    filename: str = "admin_boundary.geojson",
+) -> Path:
+    """
+    Write a jurisdiction/admin boundary overlay as a simple GeoJSON polygon.
+    """
+    if aoi_gdf is None and aoi_bounds_wgs84 is None:
+        raise ValueError("Provide either aoi_gdf or aoi_bounds_wgs84")
+
+    if aoi_gdf is not None:
+        g = aoi_gdf.copy()
+        if g.crs is None:
+            g = g.set_crs("EPSG:4326")
+        else:
+            g = g.to_crs("EPSG:4326")
+        out = g[["geometry"]].copy()
+    else:
+        b = list(aoi_bounds_wgs84)
+        if len(b) != 4:
+            raise ValueError("aoi_bounds_wgs84 must be [minx, miny, maxx, maxy]")
+        out = gpd.GeoDataFrame({"name": ["aoi_boundary"]}, geometry=[box(float(b[0]), float(b[1]), float(b[2]), float(b[3]))], crs="EPSG:4326")
+
+    return write_geojson(scenario_dir / filename, out)
+
+
+def load_buildings_access_csv_as_gdf(
+    csv_path: Path,
+    *,
+    crs: str = "EPSG:4326",
+    include_zero_people: bool = False,
+) -> gpd.GeoDataFrame:
+    """
+    Load legacy buildings_access.csv (with geometry_wkt) as a GeoDataFrame.
+    """
+    use_cols = ["building_id", "people", "dist_to_evac_m", "geometry_wkt"]
+
+    if include_zero_people:
+        df = pd.read_csv(csv_path, usecols=lambda c: c in use_cols)
+    else:
+        parts: List[pd.DataFrame] = []
+        for chunk in pd.read_csv(csv_path, usecols=lambda c: c in use_cols, chunksize=100_000):
+            p = pd.to_numeric(chunk.get("people", 0), errors="coerce").fillna(0)
+            keep = chunk[p > 0].copy()
+            if len(keep):
+                parts.append(keep)
+        df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=use_cols)
+
+    if "geometry_wkt" not in df.columns:
+        raise KeyError(f"Expected geometry_wkt column in {csv_path}")
+
+    if "building_id" not in df.columns:
+        df["building_id"] = np.arange(len(df), dtype=int)
+    if "people" not in df.columns:
+        df["people"] = 0
+    if "dist_to_evac_m" not in df.columns:
+        df["dist_to_evac_m"] = np.nan
+
+    geom = df["geometry_wkt"].fillna("").map(lambda s: wkt.loads(s) if isinstance(s, str) and s else None)
+    out = gpd.GeoDataFrame(df.drop(columns=["geometry_wkt"]), geometry=geom, crs=crs)
+    return out
+
+
+def add_buildings_overlay_to_scenario_bundle(
+    scenario_dir: Path,
+    *,
+    max_chunk_size_mb: float = 95.0,
+    include_zero_people: bool = False,
+) -> Path:
+    """
+    Convert legacy buildings_access.csv into chunked GeoJSON building overlays and
+    enrich the scenario manifest accordingly.
+    """
+    manifest_path = scenario_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing manifest in {scenario_dir}")
+
+    with manifest_path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    assets = manifest.setdefault("assets", {})
+    layers = manifest.setdefault("layers", {})
+
+    csv_rel = assets.get("buildings_access", "buildings_access.csv")
+    csv_path = scenario_dir / csv_rel
+    if not csv_path.exists():
+        return manifest_path
+
+    b = load_buildings_access_csv_as_gdf(csv_path, include_zero_people=include_zero_people)
+    meta = export_buildings_access_geojson_chunks(
+        scenario_dir,
+        b,
+        include_zero_people=include_zero_people,
+        max_chunk_size_mb=max_chunk_size_mb,
+    )
+
+    assets["buildings_access_chunks"] = meta["files"]
+    assets["buildings_access_format"] = "geojson"
+    assets["buildings_access_summary"] = {
+        "feature_count": int(meta.get("feature_count", 0)),
+        "people_total": int(meta.get("people_total", 0)),
+        "chunk_count": int(meta.get("chunk_count", len(meta.get("files", [])))),
+        "include_zero_people": bool(meta.get("include_zero_people", False)),
+    }
+
+    if "admin_boundary" not in assets:
+        aoi_bounds = manifest.get("aoi", {}).get("bounds_wgs84")
+        if aoi_bounds:
+            write_admin_boundary_geojson(scenario_dir, aoi_bounds_wgs84=aoi_bounds)
+            assets["admin_boundary"] = "admin_boundary.geojson"
+
+    layers["buildings_access"] = {
+        "type": "circle",
+        "asset": "buildings_access_chunks",
+        "radius": 2.0,
+        "color_ok": "#2ca02c",
+        "color_bad": "#d62728",
+    }
+
+    return write_json(manifest_path, manifest)
+
+
+def add_buildings_overlay_to_all_scenarios(
+    scenarios_root: Path,
+    *,
+    max_chunk_size_mb: float = 95.0,
+    include_zero_people: bool = False,
+) -> List[Path]:
+    """
+    Enrich all scenario bundles with chunked building overlays.
+    """
+    updated: List[Path] = []
+    for d in sorted(scenarios_root.iterdir()):
+        if d.is_dir() and (d / "manifest.json").exists():
+            updated.append(
+                add_buildings_overlay_to_scenario_bundle(
+                    d,
+                    max_chunk_size_mb=max_chunk_size_mb,
+                    include_zero_people=include_zero_people,
+                )
+            )
+    return updated
 
 
 def edge_keys_to_geodataframe(
