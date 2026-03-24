@@ -64,8 +64,8 @@
 
     <div class="row">
       <label>Water mask opacity</label>
-      <input id="opacity" type="range" min="0" max="1" step="0.05" value="0.65" />
-      <small id="opacityLabel">0.65</small>
+      <input id="opacity" type="range" min="0" max="1" step="0.05" value="1.0" />
+      <small id="opacityLabel">1.0</small>
     </div>
 
     <div class="row">
@@ -156,10 +156,14 @@
   const LYR_EVAC = "evac-paths-layer";
   const SRC_BUILDINGS = "buildings-access";
   const LYR_BUILDINGS = "buildings-access-layer";
+  const SRC_ZONES = "accessibility-zones";
+  const LYR_ZONES_FILL = "accessibility-zones-fill";
+  const LYR_ZONES_LINE = "accessibility-zones-line";
   const SRC_ADMIN = "admin-boundary";
   const LYR_ADMIN = "admin-boundary-layer";
 
   let buildingsFeatures = [];
+  let zonesFeatures = [];
   let metricsData = null;
   let buildingsChunkUrls = [];
   const buildingsChunkCache = new Map();
@@ -248,6 +252,7 @@
     map.getSource(SRC_BUILDINGS).setData({ type: "FeatureCollection", features: safe });
     buildingsFeatures = safe;
     applyBuildingThresholdStyle();
+    applyZoneThresholdStyle();
     updateAffectedKPIs();
   }
 
@@ -349,6 +354,8 @@
     setLayerVisibility(LYR_FAILED, chkFailed.checked);
     setLayerVisibility(LYR_EVAC, chkEvac.checked);
     setLayerVisibility(LYR_BUILDINGS, chkBuildings.checked);
+    setLayerVisibility(LYR_ZONES_FILL, chkBuildings.checked);
+    setLayerVisibility(LYR_ZONES_LINE, chkBuildings.checked);
     if (chkBuildings.checked) {
       scheduleBuildingsRefresh(20);
     } else {
@@ -373,10 +380,38 @@
     const thr = parseFloat(accessThreshold.value) || 0;
     map.setPaintProperty(LYR_BUILDINGS, "circle-color", [
       "case",
-      ["<=", ["to-number", ["get", "dist_to_evac_m"]], thr],
+      [
+        "<=",
+        [
+          "coalesce",
+          ["to-number", ["get", "dist_to_connected_road_m"]],
+          ["to-number", ["get", "dist_to_evac_m"]],
+          1e15
+        ],
+        thr
+      ],
       "#2ca02c",
       "#d62728"
     ]);
+  }
+
+  function applyZoneThresholdStyle() {
+    if (!map) return;
+    const thr = parseFloat(accessThreshold.value) || 0;
+    const zoneColorExpr = [
+      "case",
+      ["<=", ["coalesce", ["to-number", ["get", "dist_mean_m"]], 1e15], thr],
+      "#2ca02c",
+      ["==", ["get", "zone_status"], "safe"],
+      "#2ca02c",
+      "#d62728"
+    ];
+    if (map.getLayer(LYR_ZONES_FILL)) {
+      map.setPaintProperty(LYR_ZONES_FILL, "fill-color", zoneColorExpr);
+    }
+    if (map.getLayer(LYR_ZONES_LINE)) {
+      map.setPaintProperty(LYR_ZONES_LINE, "line-color", zoneColorExpr);
+    }
   }
 
   function updateAffectedKPIs() {
@@ -386,10 +421,31 @@
 
     for (const f of buildingsFeatures) {
       const p = Number(f?.properties?.people ?? 0);
-      const d = Number(f?.properties?.dist_to_evac_m ?? NaN);
+      const d = Number(
+        f?.properties?.dist_to_connected_road_m ??
+        f?.properties?.dist_to_evac_m ??
+        NaN
+      );
       if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(d)) continue;
       total += p;
       if (d <= thr) accessible += p;
+    }
+
+    if (!total && zonesFeatures.length) {
+      let zTotal = 0;
+      let zAccessible = 0;
+      for (const z of zonesFeatures) {
+        const p = Number(z?.properties?.people_total ?? 0);
+        const d = Number(z?.properties?.dist_mean_m ?? NaN);
+        const status = String(z?.properties?.zone_status ?? "").toLowerCase();
+        if (!Number.isFinite(p) || p <= 0) continue;
+        zTotal += p;
+        if ((Number.isFinite(d) && d <= thr) || (!Number.isFinite(d) && status === "safe")) {
+          zAccessible += p;
+        }
+      }
+      total = zTotal;
+      accessible = zAccessible;
     }
 
     let affected = total - accessible;
@@ -487,6 +543,58 @@
     });
   }
 
+  async function loadAccessibilityZones(base, assets) {
+    if (map.getLayer(LYR_ZONES_LINE)) map.removeLayer(LYR_ZONES_LINE);
+    if (map.getLayer(LYR_ZONES_FILL)) map.removeLayer(LYR_ZONES_FILL);
+    if (map.getSource(SRC_ZONES)) map.removeSource(SRC_ZONES);
+    zonesFeatures = [];
+
+    if (!assets.accessibility_zones) return;
+
+    const url = `${base}${assets.accessibility_zones}`;
+    const r = await fetch(url);
+    if (!r.ok) return;
+    const fc = await r.json();
+    zonesFeatures = Array.isArray(fc?.features) ? fc.features : [];
+
+    map.addSource(SRC_ZONES, {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: zonesFeatures }
+    });
+
+    const beforeId = map.getLayer(LYR_ROADS) ? LYR_ROADS : undefined;
+    map.addLayer(
+      {
+        id: LYR_ZONES_FILL,
+        type: "fill",
+        source: SRC_ZONES,
+        maxzoom: BUILDINGS_MIN_ZOOM,
+        paint: {
+          "fill-opacity": 0.24,
+          "fill-outline-color": "rgba(0,0,0,0)"
+        }
+      },
+      beforeId
+    );
+
+    map.addLayer(
+      {
+        id: LYR_ZONES_LINE,
+        type: "line",
+        source: SRC_ZONES,
+        maxzoom: BUILDINGS_MIN_ZOOM,
+        paint: {
+          "line-width": 0.6,
+          "line-opacity": 0.42
+        }
+      },
+      beforeId
+    );
+
+    applyZoneThresholdStyle();
+    updateAffectedKPIs();
+  }
+
   async function loadBuildingsLayer(base, assets) {
     if (map.getLayer(LYR_BUILDINGS)) map.removeLayer(LYR_BUILDINGS);
     if (map.getSource(SRC_BUILDINGS)) map.removeSource(SRC_BUILDINGS);
@@ -570,6 +678,7 @@
       await loadVectorLayer(SRC_EVAC, LYR_EVAC, `${base}${assets.evac_paths}`, "#2ca02c", 2.8);
     }
     await loadAdminBoundary(base, assets);
+    await loadAccessibilityZones(base, assets);
     await loadBuildingsLayer(base, assets);
 
     if (manifest.parameters && Number.isFinite(Number(manifest.parameters.access_radius_m))) {
@@ -580,6 +689,7 @@
     scenarioInfo.textContent = JSON.stringify(manifest.parameters || {}, null, 0);
     onTimeChange();
     applyBuildingThresholdStyle();
+    applyZoneThresholdStyle();
     updateAffectedKPIs();
     updateVisibility();
   }
@@ -639,6 +749,7 @@
     accessThreshold.addEventListener("input", () => {
       accessThresholdLabel.textContent = `${accessThreshold.value} m`;
       applyBuildingThresholdStyle();
+      applyZoneThresholdStyle();
       updateAffectedKPIs();
     });
     document.getElementById("playBtn").addEventListener("click", startPlayback);

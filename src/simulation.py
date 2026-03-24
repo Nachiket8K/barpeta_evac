@@ -431,6 +431,131 @@ def evac_edges_to_geoseries(
     return gpd.GeoSeries(geoms, crs=crs)
 
 
+def _normalize_highway_values(hw: Any) -> set[str]:
+    """
+    Normalize OSM highway attribute values into lowercase tokens.
+
+    Handles values that may be list/tuple/set or GraphML-serialized strings.
+    """
+    if hw is None:
+        return set()
+
+    if isinstance(hw, (list, tuple, set)):
+        return {str(x).strip().lower() for x in hw if str(x).strip()}
+
+    s = str(hw).strip().lower()
+    if not s:
+        return set()
+
+    # Handle stringified list forms e.g. "['primary', 'secondary']"
+    for ch in "[]()'\"":
+        s = s.replace(ch, "")
+
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    return set(parts if parts else [s])
+
+
+def _egress_nodes_from_highway_classes(
+    G: nx.MultiDiGraph,
+    egress_highways: Optional[Sequence[str]] = None,
+) -> set[Any]:
+    """
+    Collect nodes incident to high-order road classes (highway/trunk/primary).
+    """
+    keep = {
+        "motorway", "motorway_link",
+        "trunk", "trunk_link",
+        "primary", "primary_link",
+    }
+    if egress_highways is not None:
+        keep = {str(x).strip().lower() for x in egress_highways if str(x).strip()}
+
+    out: set[Any] = set()
+    for u, v, _, data in G.edges(keys=True, data=True):
+        vals = _normalize_highway_values(data.get("highway"))
+        if vals and any(h in keep for h in vals):
+            out.add(u)
+            out.add(v)
+    return out
+
+
+def connected_egress_edge_keys(
+    G: nx.MultiDiGraph,
+    *,
+    exit_nodes: Optional[Sequence[Any]] = None,
+    egress_highways: Optional[Sequence[str]] = None,
+) -> set[EdgeKey]:
+    """
+    Return edges in intact graph components that connect to egress targets.
+
+    Egress targets are union(exit_nodes, nodes on high-order highways).
+    Connectivity is evaluated on the undirected topology so that component-level
+    survivability is represented even with one-way directionality in raw edges.
+    """
+    targets: set[Any] = set(exit_nodes or [])
+    targets.update(_egress_nodes_from_highway_classes(G, egress_highways=egress_highways))
+    if not targets:
+        return set()
+
+    UG = G.to_undirected(as_view=False)
+    reachable_nodes: set[Any] = set()
+    for n in targets:
+        if n in UG and n not in reachable_nodes:
+            reachable_nodes.update(nx.node_connected_component(UG, n))
+
+    if not reachable_nodes:
+        return set()
+
+    connected_edges: set[EdgeKey] = set()
+    for u, v, k in G.edges(keys=True):
+        if u in reachable_nodes and v in reachable_nodes:
+            connected_edges.add((u, v, k))
+
+    return connected_edges
+
+
+def compute_building_distance_to_connected_roads(
+    buildings: gpd.GeoDataFrame,
+    G_intact: nx.MultiDiGraph,
+    *,
+    exit_nodes: Optional[Sequence[Any]] = None,
+    egress_highways: Optional[Sequence[str]] = None,
+    metric_crs: Optional[str] = None,
+    use_centroids: bool = True,
+    access_radius_m: Optional[float] = None,
+) -> gpd.GeoDataFrame:
+    """
+    Distance from each building to nearest intact road segment that belongs to a
+    component connected to egress (highway/exit reachability).
+
+    Output columns:
+      - dist_to_connected_road_m
+      - dist_to_evac_m (backward-compatible alias)
+      - is_accessible_network (if access_radius_m is provided)
+    """
+    edge_keys = connected_egress_edge_keys(
+        G_intact,
+        exit_nodes=exit_nodes,
+        egress_highways=egress_highways,
+    )
+    connected_lines = evac_edges_to_geoseries(G_intact, edge_keys, crs="EPSG:4326")
+
+    b = compute_building_distance_to_evac_paths(
+        buildings,
+        connected_lines,
+        metric_crs=metric_crs,
+        use_centroids=use_centroids,
+    )
+
+    b["dist_to_connected_road_m"] = pd.to_numeric(b["dist_to_evac_m"], errors="coerce")
+
+    if access_radius_m is not None:
+        d = b["dist_to_connected_road_m"].to_numpy(dtype=float)
+        b["is_accessible_network"] = np.isfinite(d) & (d <= float(access_radius_m))
+
+    return b
+
+
 # -----------------------------------------------------------------------------
 # People placement
 # -----------------------------------------------------------------------------
@@ -1042,11 +1167,13 @@ def run_one_realization(
         weight_col=building_weight_col,
     )
 
-    b_dist = compute_building_distance_to_evac_paths(
+    b_dist = compute_building_distance_to_connected_roads(
         b_people,
-        evac_lines,
+        H,
+        exit_nodes=exit_nodes,
         metric_crs=None,
-        use_centroids=True
+        use_centroids=True,
+        access_radius_m=params.access_radius_m,
     )
     mets = accessibility_metrics(b_dist, radius_m=params.access_radius_m, people_col="people")
 
@@ -1129,11 +1256,13 @@ def run_one_realization_detailed(
             weight_col=building_weight_col,
         )
 
-    b_dist = compute_building_distance_to_evac_paths(
+    b_dist = compute_building_distance_to_connected_roads(
         b_people,
-        evac_lines,
+        H,
+        exit_nodes=exit_nodes,
         metric_crs=None,
         use_centroids=True,
+        access_radius_m=params.access_radius_m,
     )
 
     # Build metrics from the already-sampled realization (no re-sampling).

@@ -65,6 +65,8 @@ def _feature_json_size_estimate(
     ys: np.ndarray,
     props_df: pd.DataFrame,
     *,
+    dist_prop_name: str = "dist_to_evac_m",
+    include_legacy_dist_alias: bool = False,
     sample_n: int = 2000,
     coord_precision: int = 6,
 ) -> float:
@@ -91,9 +93,11 @@ def _feature_json_size_estimate(
             "properties": {
                 "building_id": int(props_df.iloc[i]["building_id"]),
                 "people": int(props_df.iloc[i]["people"]),
-                "dist_to_evac_m": float(props_df.iloc[i]["dist_to_evac_m"]),
+                dist_prop_name: float(props_df.iloc[i]["dist_value"]),
             },
         }
+        if include_legacy_dist_alias and dist_prop_name != "dist_to_evac_m":
+            feat["properties"]["dist_to_evac_m"] = float(props_df.iloc[i]["dist_value"])
         sizes.append(len(json.dumps(feat, separators=(",", ":"), ensure_ascii=False)))
 
     return float(np.mean(sizes)) if sizes else 128.0
@@ -162,16 +166,26 @@ def export_buildings_access_geojson_chunks(
     bb = b.geometry.bounds
     xs = np.round(((bb.minx.to_numpy(dtype=float) + bb.maxx.to_numpy(dtype=float)) * 0.5), coord_precision)
     ys = np.round(((bb.miny.to_numpy(dtype=float) + bb.maxy.to_numpy(dtype=float)) * 0.5), coord_precision)
+    dist_prop_name = str(dist_col) if isinstance(dist_col, str) and dist_col else "dist_to_evac_m"
+    include_legacy_dist_alias = dist_prop_name != "dist_to_evac_m"
+
     props = pd.DataFrame(
         {
             "building_id": pd.to_numeric(b[building_id_col], errors="coerce").fillna(0).astype(np.int64),
             "people": pd.to_numeric(b[people_col], errors="coerce").fillna(0).astype(np.int64),
-            "dist_to_evac_m": pd.to_numeric(b[dist_col], errors="coerce").fillna(np.nan).astype(float),
+            "dist_value": pd.to_numeric(b[dist_col], errors="coerce").fillna(np.nan).astype(float),
         }
     )
 
     n = len(props)
-    avg_feature_bytes = _feature_json_size_estimate(xs, ys, props, coord_precision=coord_precision)
+    avg_feature_bytes = _feature_json_size_estimate(
+        xs,
+        ys,
+        props,
+        dist_prop_name=dist_prop_name,
+        include_legacy_dist_alias=include_legacy_dist_alias,
+        coord_precision=coord_precision,
+    )
     estimated_total_bytes = avg_feature_bytes * float(n) + 64.0
     max_bytes = float(max_chunk_size_mb) * 1024.0 * 1024.0
 
@@ -192,7 +206,7 @@ def export_buildings_access_geojson_chunks(
         # Pre-materialize arrays once (avoid DataFrame .iloc in tight loops).
         ids = props["building_id"].to_numpy(dtype=np.int64, copy=False)
         ppl = props["people"].to_numpy(dtype=np.int64, copy=False)
-        dists = props["dist_to_evac_m"].to_numpy(dtype=float, copy=False)
+        dists = props["dist_value"].to_numpy(dtype=float, copy=False)
 
         for i in range(chunk_count):
             start = i * rows_per_chunk
@@ -214,10 +228,16 @@ def export_buildings_access_geojson_chunks(
 
                     # Manual compact serialization is significantly faster here than
                     # allocating dicts + calling json.dumps for every feature.
-                    f.write(
-                        f'{{"type":"Feature","geometry":{{"type":"Point","coordinates":[{xs[j]:.{coord_precision}f},{ys[j]:.{coord_precision}f}]}}'
-                        f',"properties":{{"building_id":{int(ids[j])},"people":{int(ppl[j])},"dist_to_evac_m":{float(dists[j]):.3f}}}}}'
-                    )
+                    if include_legacy_dist_alias:
+                        f.write(
+                            f'{{"type":"Feature","geometry":{{"type":"Point","coordinates":[{xs[j]:.{coord_precision}f},{ys[j]:.{coord_precision}f}]}}'
+                            f',"properties":{{"building_id":{int(ids[j])},"people":{int(ppl[j])},"{dist_prop_name}":{float(dists[j]):.3f},"dist_to_evac_m":{float(dists[j]):.3f}}}}}'
+                        )
+                    else:
+                        f.write(
+                            f'{{"type":"Feature","geometry":{{"type":"Point","coordinates":[{xs[j]:.{coord_precision}f},{ys[j]:.{coord_precision}f}]}}'
+                            f',"properties":{{"building_id":{int(ids[j])},"people":{int(ppl[j])},"{dist_prop_name}":{float(dists[j]):.3f}}}}}'
+                        )
 
                 f.write("]}")
 
@@ -242,6 +262,148 @@ def export_buildings_access_geojson_chunks(
         "estimated_total_mb": float(estimated_total_bytes / (1024.0 * 1024.0)),
         "max_chunk_size_mb": float(max_chunk_size_mb),
         "max_chunk_written_mb": float(max(chunk_sizes) / (1024.0 * 1024.0)) if 'chunk_sizes' in locals() and chunk_sizes else 0.0,
+    }
+
+
+def export_accessibility_zones_geojson(
+    scenario_dir: Path,
+    buildings: gpd.GeoDataFrame,
+    *,
+    out_name: str = "accessibility_zones.geojson",
+    people_col: str = "people",
+    dist_col: str = "dist_to_connected_road_m",
+    accessible_col: str = "is_accessible_network",
+    default_threshold_m: float = 1000.0,
+    cell_size_m: float = 600.0,
+) -> Dict[str, Any]:
+    """
+    Export rough low-zoom safe/unsafe accessibility zones as grid polygons.
+
+    Zones are people-weighted aggregates from buildings and are intended for
+    low-zoom rendering when individual houses are not shown.
+    """
+    ensure_dir(scenario_dir)
+
+    b = buildings.copy()
+    if len(b) == 0 or "geometry" not in b.columns:
+        payload = {"type": "FeatureCollection", "features": []}
+        out_path = scenario_dir / out_name
+        out_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        return {
+            "file": out_name,
+            "zone_count": 0,
+            "people_total": 0,
+            "cell_size_m": float(cell_size_m),
+        }
+
+    if b.crs is None:
+        b = b.set_crs("EPSG:4326")
+
+    if people_col not in b.columns:
+        b[people_col] = 0
+    if dist_col not in b.columns:
+        b[dist_col] = np.nan
+
+    b[people_col] = pd.to_numeric(b[people_col], errors="coerce").fillna(0).astype(float)
+    b[dist_col] = pd.to_numeric(b[dist_col], errors="coerce").astype(float)
+    b = b[(b[people_col] > 0) & np.isfinite(b[dist_col])].copy()
+
+    if len(b) == 0:
+        payload = {"type": "FeatureCollection", "features": []}
+        out_path = scenario_dir / out_name
+        out_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        return {
+            "file": out_name,
+            "zone_count": 0,
+            "people_total": 0,
+            "cell_size_m": float(cell_size_m),
+        }
+
+    metric_crs = b.estimate_utm_crs()
+    b_m = b.to_crs(metric_crs)
+
+    # Use representative points for robust zone assignment.
+    pts = b_m.geometry.centroid
+    x = pts.x.to_numpy(dtype=float)
+    y = pts.y.to_numpy(dtype=float)
+    ppl = b_m[people_col].to_numpy(dtype=float)
+    dist = b_m[dist_col].to_numpy(dtype=float)
+
+    cell = float(max(cell_size_m, 50.0))
+    gx = np.floor(x / cell).astype(np.int64)
+    gy = np.floor(y / cell).astype(np.int64)
+
+    safe_mask = None
+    if accessible_col in b_m.columns:
+        safe_mask = b_m[accessible_col].astype(bool).to_numpy()
+    else:
+        safe_mask = dist <= float(default_threshold_m)
+
+    df = pd.DataFrame(
+        {
+            "gx": gx,
+            "gy": gy,
+            "people": ppl,
+            "dist_wsum": dist * ppl,
+            "safe_people": np.where(safe_mask, ppl, 0.0),
+        }
+    )
+
+    agg = (
+        df.groupby(["gx", "gy"], as_index=False)
+        .agg(
+            people_total=("people", "sum"),
+            dist_wsum=("dist_wsum", "sum"),
+            accessible_people=("safe_people", "sum"),
+        )
+    )
+    if len(agg) == 0:
+        payload = {"type": "FeatureCollection", "features": []}
+        out_path = scenario_dir / out_name
+        out_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        return {
+            "file": out_name,
+            "zone_count": 0,
+            "people_total": 0,
+            "cell_size_m": float(cell_size_m),
+        }
+
+    agg["dist_mean_m"] = np.where(agg["people_total"] > 0, agg["dist_wsum"] / agg["people_total"], np.nan)
+    agg["affected_people"] = np.maximum(agg["people_total"] - agg["accessible_people"], 0.0)
+    agg["access_frac"] = np.where(agg["people_total"] > 0, agg["accessible_people"] / agg["people_total"], np.nan)
+    agg["zone_status"] = np.where(agg["dist_mean_m"] <= float(default_threshold_m), "safe", "unsafe")
+
+    geoms = []
+    for r in agg.itertuples(index=False):
+        minx = float(r.gx) * cell
+        miny = float(r.gy) * cell
+        geoms.append(box(minx, miny, minx + cell, miny + cell))
+
+    zones_m = gpd.GeoDataFrame(agg, geometry=geoms, crs=metric_crs)
+    zones = zones_m.to_crs("EPSG:4326")
+    zones["zone_id"] = np.arange(len(zones), dtype=int)
+
+    keep_cols = [
+        "zone_id",
+        "zone_status",
+        "people_total",
+        "accessible_people",
+        "affected_people",
+        "access_frac",
+        "dist_mean_m",
+        "geometry",
+    ]
+    zones_out = zones[keep_cols].copy()
+
+    out_path = scenario_dir / out_name
+    write_geojson(out_path, zones_out)
+
+    return {
+        "file": out_name,
+        "zone_count": int(len(zones_out)),
+        "people_total": int(round(float(zones_out["people_total"].sum()))),
+        "cell_size_m": float(cell),
+        "default_threshold_m": float(default_threshold_m),
     }
 
 

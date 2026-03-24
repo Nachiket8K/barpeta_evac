@@ -81,6 +81,12 @@
       "asset": "buildings_access_chunks",
       "color_ok": "#2ca02c",
       "color_bad": "#d62728"
+    },
+    "accessibility_zones": {
+      "type": "fill",
+      "asset": "accessibility_zones.geojson",
+      "color_ok": "#2ca02c",
+      "color_bad": "#d62728"
     }
   },
   "assets": {
@@ -98,6 +104,13 @@
       "people_total": 2899777,
       "chunk_count": 2,
       "include_zero_people": false
+    },
+    "accessibility_zones": "accessibility_zones.geojson",
+    "accessibility_zones_summary": {
+      "zone_count": 5057,
+      "people_total": 2899777,
+      "cell_size_m": 600.0,
+      "default_threshold_m": 1000.0
     },
     "admin_boundary": "admin_boundary.geojson",
     "roads_base": "roads_base.geojson",

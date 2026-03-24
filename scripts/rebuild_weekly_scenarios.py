@@ -229,11 +229,21 @@ def main() -> None:
             scenario_dir,
             detail["buildings"],
             people_col="people",
-            dist_col="dist_to_evac_m",
+            dist_col="dist_to_connected_road_m",
             building_id_col="building_id",
             include_zero_people=False,
             max_chunk_size_mb=95.0,
             min_chunks_if_exceeds=2,
+        )
+        zones_meta = scenario_export.export_accessibility_zones_geojson(
+            scenario_dir,
+            detail["buildings"],
+            out_name="accessibility_zones.geojson",
+            people_col="people",
+            dist_col="dist_to_connected_road_m",
+            accessible_col="is_accessible_network",
+            default_threshold_m=access_radius_m,
+            cell_size_m=600.0,
         )
         print(f"export_buildings_geojson_done={scenario_id}", flush=True)
         scenario_export.write_admin_boundary_geojson(scenario_dir, aoi_gdf=aoi)
@@ -266,6 +276,13 @@ def main() -> None:
                     "chunk_count": int(buildings_meta["chunk_count"]),
                     "include_zero_people": False,
                 },
+                "accessibility_zones": zones_meta["file"],
+                "accessibility_zones_summary": {
+                    "zone_count": int(zones_meta.get("zone_count", 0)),
+                    "people_total": int(zones_meta.get("people_total", 0)),
+                    "cell_size_m": float(zones_meta.get("cell_size_m", 600.0)),
+                    "default_threshold_m": float(zones_meta.get("default_threshold_m", access_radius_m)),
+                },
                 "admin_boundary": "admin_boundary.geojson",
                 "roads_base": "roads_base.geojson",
                 "roads_failed": "roads_failed.geojson",
@@ -282,6 +299,12 @@ def main() -> None:
                 "buildings_access": {
                     "type": "circle",
                     "asset": "buildings_access_chunks",
+                    "color_ok": "#2ca02c",
+                    "color_bad": "#d62728",
+                },
+                "accessibility_zones": {
+                    "type": "fill",
+                    "asset": "accessibility_zones.geojson",
                     "color_ok": "#2ca02c",
                     "color_bad": "#d62728",
                 },
@@ -307,7 +330,11 @@ def main() -> None:
             },
         )
         summary_rows.append(metrics)
-        print(f"built={scenario_id} chunks={buildings_meta['chunk_count']} people_total={buildings_meta['people_total']}", flush=True)
+        print(
+            f"built={scenario_id} chunks={buildings_meta['chunk_count']} "
+            f"people_total={buildings_meta['people_total']} zones={zones_meta.get('zone_count', 0)}",
+            flush=True,
+        )
 
     summary = pd.DataFrame(summary_rows).sort_values("seed").reset_index(drop=True)
     summary.to_csv(scenarios_root / "scenario_summary.csv", index=False)
