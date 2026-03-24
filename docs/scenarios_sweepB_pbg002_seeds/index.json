@@ -1,0 +1,61 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "barpeta_oct_seed_1",
+      "path": "scenarios_sweepB_pbg002_seeds/barpeta_oct_seed_1/manifest.json",
+      "parameters": {
+        "seed": 1,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "p_background": 0.02
+      }
+    },
+    {
+      "scenario_id": "barpeta_oct_seed_42",
+      "path": "scenarios_sweepB_pbg002_seeds/barpeta_oct_seed_42/manifest.json",
+      "parameters": {
+        "seed": 42,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "p_background": 0.02
+      }
+    },
+    {
+      "scenario_id": "barpeta_oct_seed_5",
+      "path": "scenarios_sweepB_pbg002_seeds/barpeta_oct_seed_5/manifest.json",
+      "parameters": {
+        "seed": 5,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "p_background": 0.02
+      }
+    },
+    {
+      "scenario_id": "barpeta_oct_seed_7",
+      "path": "scenarios_sweepB_pbg002_seeds/barpeta_oct_seed_7/manifest.json",
+      "parameters": {
+        "seed": 7,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "p_background": 0.02
+      }
+    }
+  ],
+  "options": {
+    "seed": [
+      1,
+      5,
+      7,
+      42
+    ],
+    "damage_month": [
+      "oct"
+    ],
+    "access_radius_m": [
+      1000.0
+    ],
+    "p_background": [
+      0.02
+    ]
+  }
+}
