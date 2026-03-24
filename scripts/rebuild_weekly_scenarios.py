@@ -208,6 +208,9 @@ def main() -> None:
     else:
         scenario_export.ensure_dir(scenarios_root)
     index_path = scenarios_root / "index.json"
+    master_index_path = docs_root / "scenarios" / "index.json"
+    if index_path != master_index_path:
+        scenario_export.ensure_dir(master_index_path.parent)
     summary_rows: list[dict] = []
 
     include_pbg_in_id = bool(args.force_pbg_in_id) or (len(p_background_values) > 1)
@@ -388,25 +391,33 @@ def main() -> None:
             )
             scenario_export.write_json(scenario_dir / "manifest.json", manifest)
 
+            scenario_index_entry = {
+                "scenario_id": scenario_id,
+                "path": f"{str(args.scenarios_subdir).rstrip('/')}/{scenario_id}/manifest.json",
+                "parameters": {
+                    "seed": int(seed),
+                    "damage_month": damage_month,
+                    "access_radius_m": access_radius_m,
+                    "p_background": float(p_background),
+                },
+            }
+            scenario_options_updates = {
+                "seed": [int(seed)],
+                "damage_month": [damage_month],
+                "access_radius_m": [access_radius_m],
+                "p_background": [float(p_background)],
+            }
             scenario_export.update_index_json(
                 index_path,
-                {
-                    "scenario_id": scenario_id,
-                    "path": f"{str(args.scenarios_subdir).rstrip('/')}/{scenario_id}/manifest.json",
-                    "parameters": {
-                        "seed": int(seed),
-                        "damage_month": damage_month,
-                        "access_radius_m": access_radius_m,
-                        "p_background": float(p_background),
-                    },
-                },
-                options_updates={
-                    "seed": [int(seed)],
-                    "damage_month": [damage_month],
-                    "access_radius_m": [access_radius_m],
-                    "p_background": [float(p_background)],
-                },
+                scenario_index_entry,
+                options_updates=scenario_options_updates,
             )
+            if index_path != master_index_path:
+                scenario_export.update_index_json(
+                    master_index_path,
+                    scenario_index_entry,
+                    options_updates=scenario_options_updates,
+                )
             summary_rows.append(metrics)
             print(
                 f"built={scenario_id} p_background={p_background:.6g} chunks={buildings_meta['chunk_count']} "
