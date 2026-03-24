@@ -11,6 +11,16 @@
       }
     },
     {
+      "scenario_id": "barpeta_oct_seed_100",
+      "path": "scenarios_sweepB_pbg002_seeds/barpeta_oct_seed_100/manifest.json",
+      "parameters": {
+        "seed": 100,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "p_background": 0.02
+      }
+    },
+    {
       "scenario_id": "barpeta_oct_seed_42",
       "path": "scenarios_sweepB_pbg002_seeds/barpeta_oct_seed_42/manifest.json",
       "parameters": {
@@ -46,7 +56,8 @@
       1,
       5,
       7,
-      42
+      42,
+      100
     ],
     "damage_month": [
       "oct"
