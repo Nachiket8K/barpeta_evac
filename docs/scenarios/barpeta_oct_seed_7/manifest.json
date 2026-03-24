@@ -43,7 +43,7 @@
     "p_background": 0.02,
     "mask_dem_weight": 0.25,
     "mask_threshold": 0.5,
-    "population_allocation_method": "vector:popthresh"
+    "population_allocation_method": "raster"
   },
   "layers": {
     "water_mask": {
@@ -71,10 +71,14 @@
       "asset": "evac_paths.geojson",
       "color": "#2ca02c"
     },
+    "admin_boundary": {
+      "type": "line",
+      "asset": "admin_boundary.geojson",
+      "color": "#1f77b4"
+    },
     "buildings_access": {
       "type": "circle",
       "asset": "buildings_access_chunks",
-      "radius": 2.0,
       "color_ok": "#2ca02c",
       "color_bad": "#d62728"
     }
@@ -84,21 +88,21 @@
     "failed_edges": "failed_edges.csv",
     "evac_edges": "evac_edges.csv",
     "routes": "routes.json",
-    "buildings_access": "buildings_access.csv",
-    "roads_base": "roads_base.geojson",
-    "roads_failed": "roads_failed.geojson",
-    "evac_paths": "evac_paths.geojson",
     "buildings_access_chunks": [
-      "buildings_access_part1.geojson"
+      "buildings_access_part1.geojson",
+      "buildings_access_part2.geojson"
     ],
     "buildings_access_format": "geojson",
     "buildings_access_summary": {
-      "feature_count": 100,
-      "people_total": 100,
-      "chunk_count": 1,
+      "feature_count": 759631,
+      "people_total": 2899777,
+      "chunk_count": 2,
       "include_zero_people": false
     },
-    "admin_boundary": "admin_boundary.geojson"
+    "admin_boundary": "admin_boundary.geojson",
+    "roads_base": "roads_base.geojson",
+    "roads_failed": "roads_failed.geojson",
+    "evac_paths": "evac_paths.geojson"
   },
   "aoi": {
     "bounds_wgs84": [

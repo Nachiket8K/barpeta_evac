@@ -61,7 +61,8 @@ def write_geojson(path: Path, gdf: gpd.GeoDataFrame) -> Path:
 
 
 def _feature_json_size_estimate(
-    coords: Sequence[Tuple[float, float]],
+    xs: np.ndarray,
+    ys: np.ndarray,
     props_df: pd.DataFrame,
     *,
     sample_n: int = 2000,
@@ -70,7 +71,7 @@ def _feature_json_size_estimate(
     """
     Estimate average serialized bytes per GeoJSON feature from a sample.
     """
-    n = len(coords)
+    n = len(xs)
     if n == 0:
         return 128.0
 
@@ -79,7 +80,8 @@ def _feature_json_size_estimate(
 
     sizes: List[int] = []
     for i in idx:
-        x, y = coords[i]
+        x = xs[i]
+        y = ys[i]
         feat = {
             "type": "Feature",
             "geometry": {
@@ -117,6 +119,8 @@ def export_buildings_access_geojson_chunks(
     - If estimated payload exceeds max_chunk_size_mb, split into multiple files
       (at least `min_chunks_if_exceeds`, default 2).
     """
+    ensure_dir(scenario_dir)
+
     if "geometry" not in buildings.columns:
         raise ValueError("buildings must contain a geometry column")
 
@@ -152,9 +156,12 @@ def export_buildings_access_geojson_chunks(
             "include_zero_people": bool(include_zero_people),
         }
 
-    # Build minimal props and representative points.
-    rep_pts = b.geometry.representative_point()
-    coords = [(float(g.x), float(g.y)) for g in rep_pts]
+    # Build minimal props and lightweight display points.
+    # Using polygon bbox centers is much faster than representative_point() at this scale
+    # and is sufficient for point-based thematic rendering in the web viewer.
+    bb = b.geometry.bounds
+    xs = np.round(((bb.minx.to_numpy(dtype=float) + bb.maxx.to_numpy(dtype=float)) * 0.5), coord_precision)
+    ys = np.round(((bb.miny.to_numpy(dtype=float) + bb.maxy.to_numpy(dtype=float)) * 0.5), coord_precision)
     props = pd.DataFrame(
         {
             "building_id": pd.to_numeric(b[building_id_col], errors="coerce").fillna(0).astype(np.int64),
@@ -164,7 +171,7 @@ def export_buildings_access_geojson_chunks(
     )
 
     n = len(props)
-    avg_feature_bytes = _feature_json_size_estimate(coords, props, coord_precision=coord_precision)
+    avg_feature_bytes = _feature_json_size_estimate(xs, ys, props, coord_precision=coord_precision)
     estimated_total_bytes = avg_feature_bytes * float(n) + 64.0
     max_bytes = float(max_chunk_size_mb) * 1024.0 * 1024.0
 
@@ -182,37 +189,38 @@ def export_buildings_access_geojson_chunks(
         chunk_sizes: List[int] = []
         rows_per_chunk = int(math.ceil(n / max(chunk_count, 1)))
 
+        # Pre-materialize arrays once (avoid DataFrame .iloc in tight loops).
+        ids = props["building_id"].to_numpy(dtype=np.int64, copy=False)
+        ppl = props["people"].to_numpy(dtype=np.int64, copy=False)
+        dists = props["dist_to_evac_m"].to_numpy(dtype=float, copy=False)
+
         for i in range(chunk_count):
             start = i * rows_per_chunk
             end = min((i + 1) * rows_per_chunk, n)
             if start >= end:
                 break
-
-            feats = []
-            for j in range(start, end):
-                x, y = coords[j]
-                feats.append(
-                    {
-                        "type": "Feature",
-                        "geometry": {
-                            "type": "Point",
-                            "coordinates": [round(float(x), coord_precision), round(float(y), coord_precision)],
-                        },
-                        "properties": {
-                            "building_id": int(props.iloc[j]["building_id"]),
-                            "people": int(props.iloc[j]["people"]),
-                            "dist_to_evac_m": float(props.iloc[j]["dist_to_evac_m"]),
-                        },
-                    }
-                )
-
-            payload = {"type": "FeatureCollection", "features": feats}
             name = f"buildings_access_part{i + 1}.geojson"
             out_path = scenario_dir / name
-            out_path.write_text(
-                json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
-                encoding="utf-8",
-            )
+
+            # Stream JSON directly to avoid constructing very large intermediate lists.
+            with out_path.open("w", encoding="utf-8") as f:
+                f.write('{"type":"FeatureCollection","features":[')
+                first = True
+                for j in range(start, end):
+                    if not first:
+                        f.write(",")
+                    else:
+                        first = False
+
+                    # Manual compact serialization is significantly faster here than
+                    # allocating dicts + calling json.dumps for every feature.
+                    f.write(
+                        f'{{"type":"Feature","geometry":{{"type":"Point","coordinates":[{xs[j]:.{coord_precision}f},{ys[j]:.{coord_precision}f}]}}'
+                        f',"properties":{{"building_id":{int(ids[j])},"people":{int(ppl[j])},"dist_to_evac_m":{float(dists[j]):.3f}}}}}'
+                    )
+
+                f.write("]}")
+
             out_files.append(name)
             chunk_sizes.append(int(out_path.stat().st_size))
 

@@ -297,8 +297,8 @@
 
   function updateTimeLabel(frameIdx) {
     const dates = manifest?.time?.frame_dates || [];
-    const d = dates[frameIdx] || `frame ${frameIdx}`;
-    timeLabel.textContent = `frame ${frameIdx} | ${d}`;
+    const d = dates[frameIdx] || `Week ${frameIdx}`;
+    timeLabel.textContent = `Week ${frameIdx} | ${d}`;
   }
 
   function onTimeChange() {

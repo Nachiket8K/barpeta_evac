@@ -66,7 +66,7 @@ MONTH_KEYS: Tuple[str, ...] = ("jan", "may", "oct")
 WEEKLY_START_DATE: str = "2025-05-01"
 WEEKLY_END_DATE: str = "2025-10-31"
 DEFAULT_ACCESS_RADIUS_M: float = 1000.0
-DEFAULT_SCENARIO_SEEDS: Tuple[int, ...] = (7, 42, 101, 202, 404)
+DEFAULT_SCENARIO_SEEDS: Tuple[int, ...] = (7,)
 
 EVAC_DRIVABLE_HIGHWAYS: Set[str] = {
     "trunk", "trunk_link",

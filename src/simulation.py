@@ -695,36 +695,65 @@ def allocate_population_from_raster_to_buildings(
     if b.crs is None or pop_raster_src.crs is None:
         raise ValueError("Buildings and population raster must have CRS")
 
-    pts = b.geometry.representative_point()
-    pts = gpd.GeoSeries(pts, crs=b.crs).to_crs(pop_raster_src.crs)
-    coords = [(float(p.x), float(p.y)) if p is not None and not p.is_empty else (np.nan, np.nan) for p in pts]
+    from rasterio.transform import rowcol
+    from rasterio.windows import from_bounds
 
-    vals = []
-    for x, y in coords:
-        if not np.isfinite(x) or not np.isfinite(y):
-            vals.append(0.0)
-            continue
-        try:
-            s = next(pop_raster_src.sample([(x, y)]))[0]
-            vals.append(float(s) if np.isfinite(s) else 0.0)
-        except Exception:
-            vals.append(0.0)
+    # Use geometry-bounds centers (fast) instead of representative_point() for very
+    # large building sets. This preserves a stable inside-near proxy for raster sampling
+    # while avoiding expensive per-polygon point construction.
+    bb = b.geometry.bounds
+    pts = gpd.GeoSeries(
+        gpd.points_from_xy(
+            (bb.minx.to_numpy(dtype=float) + bb.maxx.to_numpy(dtype=float)) * 0.5,
+            (bb.miny.to_numpy(dtype=float) + bb.maxy.to_numpy(dtype=float)) * 0.5,
+            crs=b.crs,
+        ),
+        crs=b.crs,
+    ).to_crs(pop_raster_src.crs)
+    xs = pts.x.to_numpy(dtype=float)
+    ys = pts.y.to_numpy(dtype=float)
 
-    w = np.asarray(vals, dtype=float)
+    # Read only the raster subset covering the building AOI, then sample it vectorially.
+    finite_xy = np.isfinite(xs) & np.isfinite(ys)
+    if not np.any(finite_xy):
+        b[out_col] = 0
+        b[f"{out_col}_weight"] = 0.0
+        return b
+
+    minx = float(np.nanmin(xs[finite_xy]))
+    miny = float(np.nanmin(ys[finite_xy]))
+    maxx = float(np.nanmax(xs[finite_xy]))
+    maxy = float(np.nanmax(ys[finite_xy]))
+    window = from_bounds(minx, miny, maxx, maxy, transform=pop_raster_src.transform)
+    window = window.round_offsets().round_lengths()
+    arr = pop_raster_src.read(1, window=window, boundless=True, fill_value=np.nan).astype(float)
+    nd = pop_raster_src.nodata
+    if nd is not None:
+        arr[arr == float(nd)] = np.nan
+
+    w = np.zeros(len(b), dtype=float)
+    valid_xy = np.isfinite(xs) & np.isfinite(ys)
+    if np.any(valid_xy):
+        rows, cols = rowcol(pop_raster_src.transform, xs[valid_xy], ys[valid_xy])
+        rows = np.asarray(rows, dtype=int) - int(window.row_off)
+        cols = np.asarray(cols, dtype=int) - int(window.col_off)
+        valid_rc = (
+            (rows >= 0)
+            & (cols >= 0)
+            & (rows < arr.shape[0])
+            & (cols < arr.shape[1])
+        )
+        sampled = np.zeros(valid_xy.sum(), dtype=float)
+        if np.any(valid_rc):
+            sampled_vals = arr[rows[valid_rc], cols[valid_rc]]
+            sampled[valid_rc] = np.where(np.isfinite(sampled_vals), sampled_vals, 0.0)
+        w[np.where(valid_xy)[0]] = sampled
+
     w[~np.isfinite(w)] = 0.0
     w = np.clip(w, 0.0, None)
 
     if total_population is None:
         # Estimate total population within the building AOI (not whole-country raster).
-        from rasterio.windows import from_bounds
-
-        b_r = b.to_crs(pop_raster_src.crs)
-        minx, miny, maxx, maxy = [float(v) for v in b_r.total_bounds]
-        window = from_bounds(minx, miny, maxx, maxy, transform=pop_raster_src.transform)
-        arr = pop_raster_src.read(1, window=window, boundless=True, fill_value=np.nan).astype(float)
-        nd = pop_raster_src.nodata
-        if nd is not None:
-            arr[arr == float(nd)] = np.nan
         total_population = int(round(float(np.nansum(np.clip(arr, 0.0, None)))))
 
     total_population = max(int(total_population), 0)
