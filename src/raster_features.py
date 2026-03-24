@@ -414,6 +414,7 @@ def build_weekly_wet_masks_from_may_oct_dem(
     dem_weight: float = 0.25,
     threshold: float = 0.5,
     nodata_values: Optional[Iterable[int]] = None,
+    return_scores: bool = True,
 ) -> Dict[str, Any]:
     """
     Build weekly wet masks by blending May and Oct wet classes + DEM risk.
@@ -433,6 +434,7 @@ def build_weekly_wet_masks_from_may_oct_dem(
     oct_ = src_oct.read(1)
     if may.shape != oct_.shape:
         raise ValueError("May and Oct LULC rasters must have identical shape")
+    out_shape = may.shape
 
     if src_may.crs is None or src_oct.crs is None:
         raise ValueError("LULC rasters must have CRS")
@@ -446,27 +448,57 @@ def build_weekly_wet_masks_from_may_oct_dem(
         if src.nodata is not None:
             nodata_set.add(int(src.nodata))
 
-    wet_may = np.isin(may, list(wet_classes)).astype(np.float32)
-    wet_oct = np.isin(oct_, list(wet_classes)).astype(np.float32)
+    # Keep wet masks boolean to reduce persistent memory footprint.
+    wet_may = np.isin(may, list(wet_classes))
+    wet_oct = np.isin(oct_, list(wet_classes))
 
     invalid = np.zeros_like(wet_may, dtype=bool)
     if len(nodata_set) > 0:
         invalid |= np.isin(may, list(nodata_set))
         invalid |= np.isin(oct_, list(nodata_set))
 
+    # Raw LULC arrays are no longer needed after deriving wet/invalid masks.
+    del may, oct_
+
     dem_on_lulc = _resample_dem_to_match_lulc(dem_src, src_may)
     dem_low = _low_elevation_risk(dem_on_lulc)
+    del dem_on_lulc
 
     masks = []
-    scores = []
-    for i in range(n_frames):
-        alpha = float(i / (n_frames - 1))
-        base = (1.0 - alpha) * wet_may + alpha * wet_oct
-        score = np.clip(base + float(dem_weight) * alpha * dem_low * (1.0 - base), 0.0, 1.0)
-        score = np.where(invalid, 0.0, score)
-        mask = (score >= float(threshold)).astype(np.uint8)
+    scores = [] if return_scores else None
 
-        scores.append(score.astype(np.float32))
+    # Reuse working arrays across frames to avoid repeated large allocations.
+    base = np.zeros_like(dem_low, dtype=np.float32)
+    tmp = np.empty_like(dem_low, dtype=np.float32)
+
+    dem_weight_f = np.float32(dem_weight)
+    threshold_f = np.float32(threshold)
+    has_invalid = bool(np.any(invalid))
+
+    for i in range(n_frames):
+        alpha = np.float32(i / (n_frames - 1))
+        beta = np.float32(1.0) - alpha
+
+        base.fill(np.float32(0.0))
+        if beta > 0:
+            np.add(base, beta, out=base, where=wet_may)
+        if alpha > 0:
+            np.add(base, alpha, out=base, where=wet_oct)
+
+        # base <- clip(base + dem_weight * alpha * dem_low * (1-base), 0, 1)
+        np.subtract(np.float32(1.0), base, out=tmp)
+        np.multiply(tmp, dem_low, out=tmp)
+        np.multiply(tmp, dem_weight_f * alpha, out=tmp)
+        np.add(base, tmp, out=base)
+        np.clip(base, np.float32(0.0), np.float32(1.0), out=base)
+
+        if has_invalid:
+            base[invalid] = np.float32(0.0)
+
+        mask = (base >= threshold_f).astype(np.uint8)
+
+        if return_scores:
+            scores.append(base.copy())
         masks.append(mask)
 
     return {
@@ -474,7 +506,7 @@ def build_weekly_wet_masks_from_may_oct_dem(
         "scores": scores,
         "transform": src_may.transform,
         "crs": src_may.crs,
-        "shape": may.shape,
+        "shape": out_shape,
         "meta": {
             "dem_weight": float(dem_weight),
             "threshold": float(threshold),
