@@ -161,6 +161,21 @@
 
   let buildingsFeatures = [];
   let metricsData = null;
+  let buildingsChunkUrls = [];
+  const buildingsChunkCache = new Map();
+  let buildingsRefreshTimer = null;
+  let buildingsRefreshToken = 0;
+  let buildingsHandlersBound = false;
+
+  const BUILDINGS_MIN_ZOOM = 11.0;
+  const BUILDINGS_CHUNK_CACHE_LIMIT = 1;
+  const BUILDINGS_MAX_FEATURES_BY_ZOOM = [
+    { z: 11, n: 2500 },
+    { z: 12, n: 7000 },
+    { z: 13, n: 15000 },
+    { z: 14, n: 30000 },
+    { z: 15, n: 60000 }
+  ];
 
   function fmtFramePath(template, frameIndex) {
     return template.replace("{frame:04d}", String(frameIndex).padStart(4, "0"));
@@ -201,12 +216,144 @@
     map.setLayoutProperty(layerId, "visibility", visible ? "visible" : "none");
   }
 
+  function emptyFeatureCollection() {
+    return { type: "FeatureCollection", features: [] };
+  }
+
+  function getBuildingFeatureBudgetForZoom(zoom) {
+    if (!Number.isFinite(zoom) || zoom < BUILDINGS_MIN_ZOOM) return 0;
+    let budget = BUILDINGS_MAX_FEATURES_BY_ZOOM[0].n;
+    for (const row of BUILDINGS_MAX_FEATURES_BY_ZOOM) {
+      if (zoom >= row.z) budget = row.n;
+    }
+    return budget;
+  }
+
+  function thinFeaturesToBudget(features, budget) {
+    if (!Array.isArray(features)) return [];
+    if (!Number.isFinite(budget) || budget <= 0) return [];
+    if (features.length <= budget) return features;
+
+    const step = Math.ceil(features.length / budget);
+    const out = [];
+    for (let i = 0; i < features.length && out.length < budget; i += step) {
+      out.push(features[i]);
+    }
+    return out;
+  }
+
+  function setBuildingsSourceData(features) {
+    if (!map || !map.getSource(SRC_BUILDINGS)) return;
+    const safe = Array.isArray(features) ? features : [];
+    map.getSource(SRC_BUILDINGS).setData({ type: "FeatureCollection", features: safe });
+    buildingsFeatures = safe;
+    applyBuildingThresholdStyle();
+    updateAffectedKPIs();
+  }
+
+  async function fetchBuildingChunkFeatures(url) {
+    if (buildingsChunkCache.has(url)) return buildingsChunkCache.get(url);
+
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`Failed to load building chunk: ${url}`);
+    const fc = await r.json();
+    const features = Array.isArray(fc?.features) ? fc.features : [];
+
+    buildingsChunkCache.set(url, features);
+    while (buildingsChunkCache.size > BUILDINGS_CHUNK_CACHE_LIMIT) {
+      const oldestKey = buildingsChunkCache.keys().next().value;
+      buildingsChunkCache.delete(oldestKey);
+    }
+
+    return features;
+  }
+
+  async function refreshBuildingsForViewport() {
+    if (!map || !map.getSource(SRC_BUILDINGS)) return;
+    if (!chkBuildings.checked) return;
+
+    const zoom = map.getZoom();
+    const budget = getBuildingFeatureBudgetForZoom(zoom);
+    if (!budget || !buildingsChunkUrls.length) {
+      setBuildingsSourceData([]);
+      return;
+    }
+
+    const token = ++buildingsRefreshToken;
+    const bounds = map.getBounds();
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+
+    const urls = buildingsChunkUrls.slice();
+    if (urls.length > 1) {
+      const c = map.getCenter();
+      const start = Math.abs(Math.floor((c.lng + c.lat) * 1000)) % urls.length;
+      urls.push(...urls.splice(0, start));
+    }
+
+    let inView = [];
+    let chunksLoaded = 0;
+
+    for (const url of urls) {
+      let features;
+      try {
+        features = await fetchBuildingChunkFeatures(url);
+      } catch (err) {
+        console.warn(err);
+        continue;
+      }
+
+      if (token !== buildingsRefreshToken) return;
+
+      chunksLoaded += 1;
+      for (const f of features) {
+        const xy = f?.geometry?.coordinates;
+        if (!Array.isArray(xy) || xy.length < 2) continue;
+        const x = Number(xy[0]);
+        const y = Number(xy[1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        if (x < west || x > east || y < south || y > north) continue;
+        inView.push(f);
+      }
+
+      // Keep low zoom very light and stop once we have enough candidates.
+      if (inView.length >= budget * 3) break;
+      if (zoom < 12.25 && chunksLoaded >= 1) break;
+    }
+
+    if (token !== buildingsRefreshToken) return;
+
+    const reduced = thinFeaturesToBudget(inView, budget);
+    setBuildingsSourceData(reduced);
+  }
+
+  function scheduleBuildingsRefresh(delayMs = 120) {
+    if (buildingsRefreshTimer) clearTimeout(buildingsRefreshTimer);
+    buildingsRefreshTimer = setTimeout(() => {
+      refreshBuildingsForViewport().catch((err) => console.error(err));
+    }, delayMs);
+  }
+
+  function bindBuildingsInteractionHandlers() {
+    if (!map || buildingsHandlersBound) return;
+    map.on("moveend", () => scheduleBuildingsRefresh(140));
+    map.on("zoomend", () => scheduleBuildingsRefresh(80));
+    buildingsHandlersBound = true;
+  }
+
   function updateVisibility() {
     setLayerVisibility(LYR_WATER, chkWater.checked);
     setLayerVisibility(LYR_ROADS, chkRoads.checked);
     setLayerVisibility(LYR_FAILED, chkFailed.checked);
     setLayerVisibility(LYR_EVAC, chkEvac.checked);
     setLayerVisibility(LYR_BUILDINGS, chkBuildings.checked);
+    if (chkBuildings.checked) {
+      scheduleBuildingsRefresh(20);
+    } else {
+      setBuildingsSourceData([]);
+    }
     updateBasemapMode();
   }
 
@@ -344,6 +491,9 @@
     if (map.getLayer(LYR_BUILDINGS)) map.removeLayer(LYR_BUILDINGS);
     if (map.getSource(SRC_BUILDINGS)) map.removeSource(SRC_BUILDINGS);
     buildingsFeatures = [];
+    buildingsChunkUrls = [];
+    buildingsChunkCache.clear();
+    buildingsRefreshToken += 1;
 
     let chunkPaths = [];
     if (Array.isArray(assets.buildings_access_chunks) && assets.buildings_access_chunks.length) {
@@ -352,27 +502,14 @@
       chunkPaths = [`${base}${assets.buildings_access}`];
     }
 
-    if (!chunkPaths.length) {
-      updateAffectedKPIs();
-      return;
-    }
+    buildingsChunkUrls = chunkPaths;
 
-    const payloads = await Promise.all(
-      chunkPaths.map(async (u) => {
-        const r = await fetch(u);
-        if (!r.ok) throw new Error(`Failed to load building chunk: ${u}`);
-        return r.json();
-      })
-    );
-
-    buildingsFeatures = payloads.flatMap((fc) => Array.isArray(fc?.features) ? fc.features : []);
-    const merged = { type: "FeatureCollection", features: buildingsFeatures };
-
-    map.addSource(SRC_BUILDINGS, { type: "geojson", data: merged });
+    map.addSource(SRC_BUILDINGS, { type: "geojson", data: emptyFeatureCollection() });
     map.addLayer({
       id: LYR_BUILDINGS,
       type: "circle",
       source: SRC_BUILDINGS,
+      minzoom: BUILDINGS_MIN_ZOOM,
       paint: {
         "circle-radius": [
           "interpolate", ["linear"], ["zoom"],
@@ -386,8 +523,10 @@
       }
     });
 
+    bindBuildingsInteractionHandlers();
     applyBuildingThresholdStyle();
     updateAffectedKPIs();
+    await refreshBuildingsForViewport();
   }
 
   async function loadScenario(scenarioEntry) {
