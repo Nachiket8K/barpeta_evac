@@ -17,6 +17,16 @@ from .config import (
     WET_CLASS_VALUES, DEFAULT_DEM_NODATA,
 )
 
+try:
+    from numba import njit, prange
+    from numba import cuda as numba_cuda
+    _HAS_NUMBA = True
+except Exception:
+    njit = None
+    prange = range
+    numba_cuda = None
+    _HAS_NUMBA = False
+
 
 # ---------------------------------------------------------------------
 # Roads: p_hazard for one month (no merges; writes directly to gdf_edges)
@@ -404,6 +414,103 @@ def _low_elevation_risk(dem_arr: np.ndarray, q_low: float = 0.05, q_high: float 
     return out
 
 
+if _HAS_NUMBA:
+    @njit(cache=True, parallel=True)
+    def _blend_frame_cpu_kernel(
+        wet_may_u8: np.ndarray,
+        wet_oct_u8: np.ndarray,
+        dem_low: np.ndarray,
+        invalid_u8: np.ndarray,
+        alpha: np.float32,
+        dem_weight: np.float32,
+        threshold: np.float32,
+    ):
+        h, w = wet_may_u8.shape
+        score = np.empty((h, w), dtype=np.float32)
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        beta = np.float32(1.0) - alpha
+        boost = dem_weight * alpha
+
+        for r in prange(h):
+            for c in range(w):
+                base = beta * wet_may_u8[r, c] + alpha * wet_oct_u8[r, c]
+                base = base + boost * dem_low[r, c] * (np.float32(1.0) - base)
+
+                if base < np.float32(0.0):
+                    base = np.float32(0.0)
+                elif base > np.float32(1.0):
+                    base = np.float32(1.0)
+
+                if invalid_u8[r, c] != 0:
+                    base = np.float32(0.0)
+
+                score[r, c] = base
+                if base >= threshold:
+                    mask[r, c] = np.uint8(1)
+
+        return mask, score
+
+
+if _HAS_NUMBA and numba_cuda is not None:
+    @numba_cuda.jit
+    def _blend_frame_cuda_kernel(
+        wet_may_u8,
+        wet_oct_u8,
+        dem_low,
+        invalid_u8,
+        alpha,
+        dem_weight,
+        threshold,
+        out_mask,
+    ):
+        r, c = numba_cuda.grid(2)
+        if r >= out_mask.shape[0] or c >= out_mask.shape[1]:
+            return
+
+        base = (np.float32(1.0) - alpha) * wet_may_u8[r, c] + alpha * wet_oct_u8[r, c]
+        base = base + (dem_weight * alpha) * dem_low[r, c] * (np.float32(1.0) - base)
+
+        if base < np.float32(0.0):
+            base = np.float32(0.0)
+        elif base > np.float32(1.0):
+            base = np.float32(1.0)
+
+        if invalid_u8[r, c] != 0:
+            base = np.float32(0.0)
+
+        out_mask[r, c] = np.uint8(1) if base >= threshold else np.uint8(0)
+
+
+def _resolve_accel_mode(accel_mode: str, *, return_scores: bool) -> tuple[str, str]:
+    mode = str(accel_mode).strip().lower()
+    if mode in {"", "default"}:
+        mode = "auto"
+    if mode not in {"auto", "none", "numba-cpu", "numba-cuda"}:
+        raise ValueError("accel_mode must be one of: auto, none, numba-cpu, numba-cuda")
+
+    if mode == "none":
+        return "numpy", "forced_none"
+
+    if mode in {"auto", "numba-cuda"} and _HAS_NUMBA and numba_cuda is not None:
+        try:
+            if numba_cuda.is_available():
+                if not return_scores:
+                    return "numba-cuda", "cuda_available"
+                if mode == "numba-cuda":
+                    return "numba-cpu" if _HAS_NUMBA else "numpy", "cuda_scores_not_supported"
+        except Exception:
+            pass
+
+    if mode in {"auto", "numba-cpu", "numba-cuda"} and _HAS_NUMBA:
+        return "numba-cpu", "numba_cpu_available"
+
+    if mode in {"numba-cpu", "numba-cuda"}:
+        return "numpy", "numba_unavailable"
+
+    return "numpy", "numpy_default"
+
+
 def build_weekly_wet_masks_from_may_oct_dem(
     src_may,
     src_oct,
@@ -415,6 +522,7 @@ def build_weekly_wet_masks_from_may_oct_dem(
     threshold: float = 0.5,
     nodata_values: Optional[Iterable[int]] = None,
     return_scores: bool = True,
+    accel_mode: str = "auto",
 ) -> Dict[str, Any]:
     """
     Build weekly wet masks by blending May and Oct wet classes + DEM risk.
@@ -464,42 +572,107 @@ def build_weekly_wet_masks_from_may_oct_dem(
     dem_low = _low_elevation_risk(dem_on_lulc)
     del dem_on_lulc
 
+    selected_accel, accel_reason = _resolve_accel_mode(accel_mode, return_scores=return_scores)
+
     masks = []
     scores = [] if return_scores else None
-
-    # Reuse working arrays across frames to avoid repeated large allocations.
-    base = np.zeros_like(dem_low, dtype=np.float32)
-    tmp = np.empty_like(dem_low, dtype=np.float32)
-
     dem_weight_f = np.float32(dem_weight)
     threshold_f = np.float32(threshold)
-    has_invalid = bool(np.any(invalid))
 
-    for i in range(n_frames):
-        alpha = np.float32(i / (n_frames - 1))
-        beta = np.float32(1.0) - alpha
+    wet_may_u8 = wet_may.astype(np.uint8, copy=False)
+    wet_oct_u8 = wet_oct.astype(np.uint8, copy=False)
+    invalid_u8 = invalid.astype(np.uint8, copy=False)
 
-        base.fill(np.float32(0.0))
-        if beta > 0:
-            np.add(base, beta, out=base, where=wet_may)
-        if alpha > 0:
-            np.add(base, alpha, out=base, where=wet_oct)
+    def _run_numpy() -> None:
+        base = np.zeros_like(dem_low, dtype=np.float32)
+        tmp = np.empty_like(dem_low, dtype=np.float32)
+        has_invalid = bool(np.any(invalid_u8))
 
-        # base <- clip(base + dem_weight * alpha * dem_low * (1-base), 0, 1)
-        np.subtract(np.float32(1.0), base, out=tmp)
-        np.multiply(tmp, dem_low, out=tmp)
-        np.multiply(tmp, dem_weight_f * alpha, out=tmp)
-        np.add(base, tmp, out=base)
-        np.clip(base, np.float32(0.0), np.float32(1.0), out=base)
+        for i in range(n_frames):
+            alpha = np.float32(i / (n_frames - 1))
+            beta = np.float32(1.0) - alpha
 
-        if has_invalid:
-            base[invalid] = np.float32(0.0)
+            base.fill(np.float32(0.0))
+            if beta > 0:
+                np.add(base, beta, out=base, where=wet_may)
+            if alpha > 0:
+                np.add(base, alpha, out=base, where=wet_oct)
 
-        mask = (base >= threshold_f).astype(np.uint8)
+            np.subtract(np.float32(1.0), base, out=tmp)
+            np.multiply(tmp, dem_low, out=tmp)
+            np.multiply(tmp, dem_weight_f * alpha, out=tmp)
+            np.add(base, tmp, out=base)
+            np.clip(base, np.float32(0.0), np.float32(1.0), out=base)
 
-        if return_scores:
-            scores.append(base.copy())
-        masks.append(mask)
+            if has_invalid:
+                base[invalid] = np.float32(0.0)
+
+            masks.append((base >= threshold_f).astype(np.uint8))
+            if return_scores:
+                scores.append(base.copy())
+
+    def _run_numba_cpu() -> None:
+        for i in range(n_frames):
+            alpha = np.float32(i / (n_frames - 1))
+            mask, score = _blend_frame_cpu_kernel(
+                wet_may_u8,
+                wet_oct_u8,
+                dem_low,
+                invalid_u8,
+                alpha,
+                dem_weight_f,
+                threshold_f,
+            )
+            masks.append(mask)
+            if return_scores:
+                scores.append(score)
+
+    def _run_numba_cuda() -> None:
+        d_wet_may = numba_cuda.to_device(wet_may_u8)
+        d_wet_oct = numba_cuda.to_device(wet_oct_u8)
+        d_dem_low = numba_cuda.to_device(dem_low.astype(np.float32, copy=False))
+        d_invalid = numba_cuda.to_device(invalid_u8)
+
+        threads = (16, 16)
+        blocks = (
+            int(np.ceil(wet_may_u8.shape[0] / threads[0])),
+            int(np.ceil(wet_may_u8.shape[1] / threads[1])),
+        )
+
+        for i in range(n_frames):
+            alpha = np.float32(i / (n_frames - 1))
+            d_mask = numba_cuda.device_array(wet_may_u8.shape, dtype=np.uint8)
+            _blend_frame_cuda_kernel[
+                blocks,
+                threads,
+            ](
+                d_wet_may,
+                d_wet_oct,
+                d_dem_low,
+                d_invalid,
+                alpha,
+                dem_weight_f,
+                threshold_f,
+                d_mask,
+            )
+            masks.append(d_mask.copy_to_host())
+
+    if selected_accel == "numba-cuda":
+        try:
+            _run_numba_cuda()
+        except Exception as e:
+            selected_accel = "numba-cpu" if _HAS_NUMBA else "numpy"
+            accel_reason = f"cuda_failed_{e.__class__.__name__}"
+
+    if selected_accel == "numba-cpu":
+        try:
+            _run_numba_cpu()
+        except Exception as e:
+            selected_accel = "numpy"
+            accel_reason = f"numba_cpu_failed_{e.__class__.__name__}"
+
+    if selected_accel == "numpy":
+        _run_numpy()
 
     return {
         "masks": masks,
@@ -511,5 +684,8 @@ def build_weekly_wet_masks_from_may_oct_dem(
             "dem_weight": float(dem_weight),
             "threshold": float(threshold),
             "wet_classes": sorted(int(v) for v in wet_classes),
+            "accel_requested": str(accel_mode),
+            "accel_selected": str(selected_accel),
+            "accel_reason": str(accel_reason),
         },
     }

@@ -484,24 +484,38 @@ def connected_egress_edge_keys(
     *,
     exit_nodes: Optional[Sequence[Any]] = None,
     egress_highways: Optional[Sequence[str]] = None,
+    use_lcc_when_no_exits: bool = True,
 ) -> set[EdgeKey]:
     """
-    Return edges in intact graph components that connect to egress targets.
+    Return edges in damaged-graph components that are egress-connected.
 
-    Egress targets are union(exit_nodes, nodes on high-order highways).
-    Connectivity is evaluated on the undirected topology so that component-level
-    survivability is represented even with one-way directionality in raw edges.
+    Connectivity is evaluated on undirected topology so one-way directionality
+    does not split physical components.
+
+    Behavior:
+      1) If valid exit_nodes are provided, keep components containing those exits.
+      2) If no valid exits and use_lcc_when_no_exits=True, keep only the LCC.
+      3) Otherwise return an empty edge set.
+
+    NOTE: `egress_highways` is retained for API compatibility but intentionally
+    not used for seeding reachability; using road class as a seed can over-credit
+    isolated damaged-network islands as accessible.
     """
-    targets: set[Any] = set(exit_nodes or [])
-    targets.update(_egress_nodes_from_highway_classes(G, egress_highways=egress_highways))
-    if not targets:
+    _ = egress_highways  # compatibility/no-op
+
+    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
         return set()
 
     UG = G.to_undirected(as_view=False)
+    targets = {n for n in (exit_nodes or []) if n in UG}
     reachable_nodes: set[Any] = set()
-    for n in targets:
-        if n in UG and n not in reachable_nodes:
-            reachable_nodes.update(nx.node_connected_component(UG, n))
+
+    if targets:
+        for n in targets:
+            if n not in reachable_nodes:
+                reachable_nodes.update(nx.node_connected_component(UG, n))
+    elif use_lcc_when_no_exits:
+        reachable_nodes = set(max(nx.connected_components(UG), key=len))
 
     if not reachable_nodes:
         return set()
@@ -516,29 +530,56 @@ def connected_egress_edge_keys(
 
 def compute_building_distance_to_connected_roads(
     buildings: gpd.GeoDataFrame,
-    G_intact: nx.MultiDiGraph,
+    G_damaged: nx.MultiDiGraph,
     *,
     exit_nodes: Optional[Sequence[Any]] = None,
     egress_highways: Optional[Sequence[str]] = None,
+    connectivity_basis: str = "lcc",
     metric_crs: Optional[str] = None,
     use_centroids: bool = True,
     access_radius_m: Optional[float] = None,
 ) -> gpd.GeoDataFrame:
     """
-    Distance from each building to nearest intact road segment that belongs to a
-    component connected to egress (highway/exit reachability).
+    Distance from each building to nearest road segment in the post-damage
+    connected network.
+
+    connectivity_basis:
+      - "lcc": use largest connected component of damaged graph (recommended)
+      - "exit_connected": use components containing exit_nodes
+      - "auto": exit-connected if exits exist, else LCC fallback
 
     Output columns:
       - dist_to_connected_road_m
       - dist_to_evac_m (backward-compatible alias)
       - is_accessible_network (if access_radius_m is provided)
     """
-    edge_keys = connected_egress_edge_keys(
-        G_intact,
-        exit_nodes=exit_nodes,
-        egress_highways=egress_highways,
-    )
-    connected_lines = evac_edges_to_geoseries(G_intact, edge_keys, crs="EPSG:4326")
+    basis = str(connectivity_basis).strip().lower()
+    if basis not in {"lcc", "exit_connected", "auto"}:
+        raise ValueError("connectivity_basis must be one of: 'lcc', 'exit_connected', 'auto'")
+
+    if basis == "lcc":
+        edge_keys = connected_egress_edge_keys(
+            G_damaged,
+            exit_nodes=None,
+            egress_highways=egress_highways,
+            use_lcc_when_no_exits=True,
+        )
+    elif basis == "exit_connected":
+        edge_keys = connected_egress_edge_keys(
+            G_damaged,
+            exit_nodes=exit_nodes,
+            egress_highways=egress_highways,
+            use_lcc_when_no_exits=False,
+        )
+    else:  # auto
+        edge_keys = connected_egress_edge_keys(
+            G_damaged,
+            exit_nodes=exit_nodes,
+            egress_highways=egress_highways,
+            use_lcc_when_no_exits=True,
+        )
+
+    connected_lines = evac_edges_to_geoseries(G_damaged, edge_keys, crs="EPSG:4326")
 
     b = compute_building_distance_to_evac_paths(
         buildings,

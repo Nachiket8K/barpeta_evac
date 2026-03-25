@@ -70,6 +70,13 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Always include p_background suffix in scenario_id.",
     )
+    ap.add_argument(
+        "--accel-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "none", "numba-cpu", "numba-cuda"],
+        help="Acceleration mode for weekly water-mask interpolation.",
+    )
     return ap.parse_args()
 
 
@@ -139,6 +146,7 @@ def main() -> None:
             dem_weight=mask_dem_weight,
             threshold=mask_threshold,
             return_scores=False,
+            accel_mode=args.accel_mode,
         )
         water_bounds = [
             float(src_may.bounds.left),
@@ -146,6 +154,12 @@ def main() -> None:
             float(src_may.bounds.right),
             float(src_may.bounds.top),
         ]
+    mask_meta = weekly.get("meta", {})
+    print(
+        f"mask_accel_selected={mask_meta.get('accel_selected', 'unknown')} "
+        f"reason={mask_meta.get('accel_reason', 'n/a')}",
+        flush=True,
+    )
     masks = weekly["masks"]
 
     g = ox.load_graphml(graphml_path)
