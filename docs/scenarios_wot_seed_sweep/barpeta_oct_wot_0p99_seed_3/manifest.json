@@ -115,7 +115,15 @@
     "admin_boundary": "admin_boundary.geojson",
     "roads_base": "roads_base.geojson",
     "roads_failed": "roads_failed.geojson",
-    "evac_paths": "evac_paths.geojson"
+    "evac_paths": "evac_paths.geojson",
+    "stranded_seed_aggregate": "../aggregates/stranded_seed_aggregate_wot_0p99_pbg_0p02.geojson",
+    "stranded_seed_aggregate_summary": {
+      "cell_count": 327082,
+      "seed_count": 8,
+      "cell_size_m": 30.0,
+      "water_over_threshold": 0.99,
+      "p_background": 0.02
+    }
   },
   "aoi": {
     "bounds_wgs84": [
