@@ -107,9 +107,9 @@
     },
     "accessibility_zones": "accessibility_zones.geojson",
     "accessibility_zones_summary": {
-      "zone_count": 160036,
+      "zone_count": 49130,
       "people_total": 2899777,
-      "cell_size_m": 60.0,
+      "cell_size_m": 150.0,
       "default_threshold_m": 1000.0
     },
     "admin_boundary": "admin_boundary.geojson",

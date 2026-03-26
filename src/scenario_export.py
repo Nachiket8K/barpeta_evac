@@ -274,7 +274,7 @@ def export_accessibility_zones_geojson(
     dist_col: str = "dist_to_connected_road_m",
     accessible_col: str = "is_accessible_network",
     default_threshold_m: float = 1000.0,
-    cell_size_m: float = 60.0,
+    cell_size_m: float = 150.0,
 ) -> Dict[str, Any]:
     """
     Export rough low-zoom safe/unsafe accessibility zones as grid polygons.
@@ -404,6 +404,196 @@ def export_accessibility_zones_geojson(
         "people_total": int(round(float(zones_out["people_total"].sum()))),
         "cell_size_m": float(cell),
         "default_threshold_m": float(default_threshold_m),
+    }
+
+
+def summarize_stranded_people_grid(
+    buildings: gpd.GeoDataFrame,
+    *,
+    people_col: str = "people",
+    dist_col: str = "dist_to_connected_road_m",
+    accessible_col: str = "is_accessible_network",
+    default_threshold_m: float = 1000.0,
+    cell_size_m: float = 30.0,
+) -> Dict[str, Any]:
+    """
+    Summarize stranded people into a fixed-size metric grid for one realization.
+
+    Returns a compact table keyed by (gx, gy) with per-cell totals:
+      - people_total
+      - stranded_people
+    """
+    b = buildings.copy()
+    if len(b) == 0 or "geometry" not in b.columns:
+        return {
+            "grid": pd.DataFrame(columns=["gx", "gy", "people_total", "stranded_people"]),
+            "metric_crs": None,
+            "cell_size_m": float(cell_size_m),
+        }
+
+    if b.crs is None:
+        b = b.set_crs("EPSG:4326")
+
+    if people_col not in b.columns:
+        b[people_col] = 0
+    if dist_col not in b.columns:
+        b[dist_col] = np.nan
+
+    b[people_col] = pd.to_numeric(b[people_col], errors="coerce").fillna(0).astype(float)
+    b[dist_col] = pd.to_numeric(b[dist_col], errors="coerce").astype(float)
+    b = b[b[people_col] > 0].copy()
+    if len(b) == 0:
+        return {
+            "grid": pd.DataFrame(columns=["gx", "gy", "people_total", "stranded_people"]),
+            "metric_crs": None,
+            "cell_size_m": float(cell_size_m),
+        }
+
+    metric_crs = b.estimate_utm_crs()
+    b_m = b.to_crs(metric_crs)
+
+    pts = b_m.geometry.centroid
+    x = pts.x.to_numpy(dtype=float)
+    y = pts.y.to_numpy(dtype=float)
+    ppl = b_m[people_col].to_numpy(dtype=float)
+
+    cell = float(max(float(cell_size_m), 5.0))
+    gx = np.floor(x / cell).astype(np.int64)
+    gy = np.floor(y / cell).astype(np.int64)
+
+    if accessible_col in b_m.columns:
+        stranded_mask = ~b_m[accessible_col].astype(bool).to_numpy()
+    else:
+        dist = b_m[dist_col].to_numpy(dtype=float)
+        stranded_mask = np.isfinite(dist) & (dist > float(default_threshold_m))
+
+    df = pd.DataFrame(
+        {
+            "gx": gx,
+            "gy": gy,
+            "people_total": ppl,
+            "stranded_people": np.where(stranded_mask, ppl, 0.0),
+        }
+    )
+    out = (
+        df.groupby(["gx", "gy"], as_index=False)
+        .agg(
+            people_total=("people_total", "sum"),
+            stranded_people=("stranded_people", "sum"),
+        )
+        .reset_index(drop=True)
+    )
+
+    return {
+        "grid": out,
+        "metric_crs": metric_crs,
+        "cell_size_m": float(cell),
+    }
+
+
+def export_seed_stranded_aggregate_geojson(
+    out_path: Path,
+    seed_grids: Sequence[pd.DataFrame],
+    *,
+    metric_crs: Any,
+    cell_size_m: float = 30.0,
+) -> Dict[str, Any]:
+    """
+    Export cross-seed stranded-grid aggregation for one threshold setting.
+
+    Output properties per cell:
+      - seed_count
+      - stranded_seed_hits
+      - stranded_seed_frac
+      - mean_stranded_people
+      - max_stranded_people
+      - mean_people_total
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    valid = [g for g in seed_grids if isinstance(g, pd.DataFrame) and len(g)]
+    seed_count = int(len(seed_grids))
+    if seed_count <= 0 or not valid or metric_crs is None:
+        payload = {"type": "FeatureCollection", "features": []}
+        out_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        return {
+            "file": out_path.name,
+            "cell_count": 0,
+            "seed_count": int(seed_count),
+            "cell_size_m": float(cell_size_m),
+        }
+
+    parts: List[pd.DataFrame] = []
+    for i, g in enumerate(seed_grids):
+        d = g.copy()
+        if len(d) == 0:
+            continue
+        cols = {"gx", "gy", "people_total", "stranded_people"}
+        if not cols.issubset(set(d.columns)):
+            continue
+        d = d[["gx", "gy", "people_total", "stranded_people"]].copy()
+        d["seed_idx"] = int(i)
+        parts.append(d)
+
+    if not parts:
+        payload = {"type": "FeatureCollection", "features": []}
+        out_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        return {
+            "file": out_path.name,
+            "cell_count": 0,
+            "seed_count": int(seed_count),
+            "cell_size_m": float(cell_size_m),
+        }
+
+    cat = pd.concat(parts, ignore_index=True)
+    cat["stranded_hit"] = (pd.to_numeric(cat["stranded_people"], errors="coerce").fillna(0) > 0).astype(int)
+
+    agg = (
+        cat.groupby(["gx", "gy"], as_index=False)
+        .agg(
+            stranded_sum=("stranded_people", "sum"),
+            stranded_max=("stranded_people", "max"),
+            people_sum=("people_total", "sum"),
+            stranded_seed_hits=("stranded_hit", "sum"),
+        )
+        .reset_index(drop=True)
+    )
+
+    denom = max(int(seed_count), 1)
+    agg["seed_count"] = int(seed_count)
+    agg["stranded_seed_frac"] = agg["stranded_seed_hits"] / float(denom)
+    agg["mean_stranded_people"] = agg["stranded_sum"] / float(denom)
+    agg["max_stranded_people"] = agg["stranded_max"]
+    agg["mean_people_total"] = agg["people_sum"] / float(denom)
+
+    cell = float(max(float(cell_size_m), 5.0))
+    geoms = []
+    for r in agg.itertuples(index=False):
+        minx = float(r.gx) * cell
+        miny = float(r.gy) * cell
+        geoms.append(box(minx, miny, minx + cell, miny + cell))
+
+    g_m = gpd.GeoDataFrame(agg, geometry=geoms, crs=metric_crs)
+    g_wgs = g_m.to_crs("EPSG:4326")
+    g_wgs["cell_id"] = np.arange(len(g_wgs), dtype=int)
+
+    keep_cols = [
+        "cell_id",
+        "seed_count",
+        "stranded_seed_hits",
+        "stranded_seed_frac",
+        "mean_stranded_people",
+        "max_stranded_people",
+        "mean_people_total",
+        "geometry",
+    ]
+    write_geojson(out_path, g_wgs[keep_cols].copy())
+
+    return {
+        "file": out_path.name,
+        "cell_count": int(len(g_wgs)),
+        "seed_count": int(seed_count),
+        "cell_size_m": float(cell),
     }
 
 
@@ -697,6 +887,39 @@ def update_index_json(
             current = set(opts.get(k, []))
             current.update(list(vals))
             opts[k] = sorted(current)
+
+    return write_json(index_path, payload)
+
+
+def remove_index_entries_by_path_prefix(index_path: Path, path_prefix: str) -> Path:
+    """
+    Remove scenario entries whose manifest path starts with a prefix and rebuild options
+    from remaining entries.
+    """
+    if not index_path.exists():
+        return index_path
+
+    with index_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    prefix = str(path_prefix).strip().rstrip("/") + "/"
+    scenarios = payload.get("scenarios", [])
+    kept = [s for s in scenarios if not str(s.get("path", "")).startswith(prefix)]
+    payload["scenarios"] = sorted(kept, key=lambda x: str(x.get("scenario_id", "")))
+
+    opt_vals: Dict[str, set] = {}
+    for s in kept:
+        p = s.get("parameters", {}) or {}
+        for k, v in p.items():
+            opt_vals.setdefault(str(k), set()).add(v)
+
+    opts: Dict[str, Any] = {}
+    for k, vals in opt_vals.items():
+        try:
+            opts[k] = sorted(vals)
+        except Exception:
+            opts[k] = sorted(list(vals), key=lambda x: str(x))
+    payload["options"] = opts
 
     return write_json(index_path, payload)
 

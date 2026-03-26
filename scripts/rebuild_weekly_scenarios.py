@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import sys
@@ -37,6 +38,10 @@ def _parse_float_list(value: str) -> list[float]:
 
 
 def _pbg_slug(v: float) -> str:
+    return _float_slug(v)
+
+
+def _float_slug(v: float) -> str:
     s = f"{float(v):.6g}"
     return s.replace("-", "m").replace(".", "p")
 
@@ -144,7 +149,7 @@ def _discover_exit_nodes_via_buffered_graph(
 
 
 def _parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Rebuild weekly evacuation scenarios for selected seeds/background failure rates")
+    ap = argparse.ArgumentParser(description="Rebuild weekly evacuation scenarios for selected seeds/thresholds/background failure rates")
     ap.add_argument(
         "--seeds",
         type=str,
@@ -156,6 +161,12 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="0.02",
         help="Comma-separated p_background values (e.g., 0,0.02,0.05,0.1,0.5)",
+    )
+    ap.add_argument(
+        "--water-over-thresholds",
+        type=str,
+        default="0.99,0.95,0.9,0.85,0.8,0.75,0.6,0.5",
+        help="Comma-separated water_over_threshold values (e.g., 0.99,0.95,0.9)",
     )
     ap.add_argument(
         "--scenarios-subdir",
@@ -229,6 +240,12 @@ def _parse_args() -> argparse.Namespace:
         choices=["buffered", "legacy"],
         help="Exit-node discovery method: buffered (new) or legacy boundary-only.",
     )
+    ap.add_argument(
+        "--aggregate-grid-cell-m",
+        type=float,
+        default=30.0,
+        help="Grid size (meters) for cross-seed stranded aggregation export.",
+    )
     return ap.parse_args()
 
 
@@ -261,13 +278,14 @@ def main() -> None:
 
     scenario_seeds = _parse_int_list(args.seeds) if str(args.seeds).strip() else list(DEFAULT_SCENARIO_SEEDS)
     p_background_values = _parse_float_list(args.p_backgrounds)
+    water_over_threshold_values = _parse_float_list(args.water_over_thresholds)
     damage_month = "oct"
     n_trucks = 20
     access_radius_m = float(DEFAULT_ACCESS_RADIUS_M)
-    water_over_threshold = 0.95
     route_weight = "length"
     exit_k = int(args.exit_k)
     exit_epsilon_deg = float(args.exit_epsilon_deg)
+    aggregate_grid_cell_m = float(args.aggregate_grid_cell_m)
 
     graphml_path = Path("outputs/tables/roads_drive_lcc.graphml")
     roads_features_parquet = Path("outputs/tables/roads_edges_features.parquet")
@@ -427,221 +445,284 @@ def main() -> None:
     master_index_path = docs_root / "scenarios" / "index.json"
     if index_path != master_index_path:
         scenario_export.ensure_dir(master_index_path.parent)
+
+    scenarios_subdir_prefix = str(args.scenarios_subdir).strip().rstrip("/")
+    if args.clear_output and scenarios_subdir_prefix:
+        scenario_export.remove_index_entries_by_path_prefix(index_path, scenarios_subdir_prefix)
+        if index_path != master_index_path:
+            scenario_export.remove_index_entries_by_path_prefix(master_index_path, scenarios_subdir_prefix)
+
     summary_rows: list[dict] = []
 
     include_pbg_in_id = bool(args.force_pbg_in_id) or (len(p_background_values) > 1)
 
     for p_background in p_background_values:
-        for seed in scenario_seeds:
-            if include_pbg_in_id:
-                scenario_id = f"barpeta_{damage_month}_seed_{seed}_pbg_{_pbg_slug(p_background)}"
-            else:
-                scenario_id = f"barpeta_{damage_month}_seed_{seed}"
-            scenario_dir = scenarios_root / scenario_id
-            scenario_export.reset_dir(scenario_dir)
+        pbg_slug = _pbg_slug(p_background)
+        for water_over_threshold in water_over_threshold_values:
+            wot_slug = _float_slug(water_over_threshold)
+            seed_grid_summaries: list[pd.DataFrame] = []
+            aggregate_metric_crs = None
+            threshold_manifest_paths: list[Path] = []
 
-            scenario_export.write_weekly_frame_stack(
-                masks,
-                scenario_dir / "frames" / "water_mask",
-                rgb=mask_rgba,
-                alpha=mask_alpha,
-            )
-            
-            print(f"frames_written={scenario_id}", flush=True)
+            for seed in scenario_seeds:
+                if include_pbg_in_id:
+                    scenario_id = f"barpeta_{damage_month}_wot_{wot_slug}_seed_{seed}_pbg_{pbg_slug}"
+                else:
+                    scenario_id = f"barpeta_{damage_month}_wot_{wot_slug}_seed_{seed}"
+                scenario_dir = scenarios_root / scenario_id
+                scenario_export.reset_dir(scenario_dir)
 
-            params = simulation.SimulationParams(
-                month=damage_month,
-                n_trucks=n_trucks,
-                n_people=total_people,
-                access_radius_m=access_radius_m,
-                seed=int(seed),
-                route_weight=route_weight,
-                failure=simulation.FailureModelParams(
-                    water_over_threshold=water_over_threshold,
-                    p_background=p_background,
-                ),
-            )
+                scenario_export.write_weekly_frame_stack(
+                    masks,
+                    scenario_dir / "frames" / "water_mask",
+                    rgb=mask_rgba,
+                    alpha=mask_alpha,
+                )
 
-            print(f"running_realization={scenario_id}", flush=True)
-            detail = simulation.run_one_realization_detailed(
-                g,
-                buildings_people,
-                source_node,
-                exit_nodes,
-                params,
-                np.random.default_rng(seed),
-                people_col="people",
-            )
-            print(f"realization_done={scenario_id}", flush=True)
+                print(f"frames_written={scenario_id}", flush=True)
 
-            failed_keys = (
-                detail["failed_edges"][["u", "v", "key"]].copy()
-                if len(detail["failed_edges"])
-                else pd.DataFrame(columns=["u", "v", "key"])
-            )
-            evac_keys = (
-                detail["evac_edges"][["u", "v", "key"]].copy()
-                if len(detail["evac_edges"])
-                else pd.DataFrame(columns=["u", "v", "key"])
-            )
+                params = simulation.SimulationParams(
+                    month=damage_month,
+                    n_trucks=n_trucks,
+                    n_people=total_people,
+                    access_radius_m=access_radius_m,
+                    seed=int(seed),
+                    route_weight=route_weight,
+                    failure=simulation.FailureModelParams(
+                        water_over_threshold=water_over_threshold,
+                        p_background=p_background,
+                    ),
+                )
 
-            roads_failed = scenario_export.edge_keys_to_geodataframe(roads_base, failed_keys)
-            roads_failed["status"] = "failed"
-            evac_paths = scenario_export.edge_keys_to_geodataframe(roads_base, evac_keys)
-            evac_paths["status"] = "evac"
+                print(f"running_realization={scenario_id}", flush=True)
+                detail = simulation.run_one_realization_detailed(
+                    g,
+                    buildings_people,
+                    source_node,
+                    exit_nodes,
+                    params,
+                    np.random.default_rng(seed),
+                    people_col="people",
+                )
+                print(f"realization_done={scenario_id}", flush=True)
 
-            scenario_export.write_geojson(scenario_dir / "roads_base.geojson", roads_base[["u", "v", "key", "status", "geometry"]])
-            scenario_export.write_geojson(scenario_dir / "roads_failed.geojson", roads_failed[["u", "v", "key", "status", "geometry"]])
-            scenario_export.write_geojson(scenario_dir / "evac_paths.geojson", evac_paths[["u", "v", "key", "status", "geometry"]])
+                failed_keys = (
+                    detail["failed_edges"][["u", "v", "key"]].copy()
+                    if len(detail["failed_edges"])
+                    else pd.DataFrame(columns=["u", "v", "key"])
+                )
+                evac_keys = (
+                    detail["evac_edges"][["u", "v", "key"]].copy()
+                    if len(detail["evac_edges"])
+                    else pd.DataFrame(columns=["u", "v", "key"])
+                )
 
-            metrics = dict(detail["metrics"])
-            metrics.update(
-                {
+                roads_failed = scenario_export.edge_keys_to_geodataframe(roads_base, failed_keys)
+                roads_failed["status"] = "failed"
+                evac_paths = scenario_export.edge_keys_to_geodataframe(roads_base, evac_keys)
+                evac_paths["status"] = "evac"
+
+                scenario_export.write_geojson(scenario_dir / "roads_base.geojson", roads_base[["u", "v", "key", "status", "geometry"]])
+                scenario_export.write_geojson(scenario_dir / "roads_failed.geojson", roads_failed[["u", "v", "key", "status", "geometry"]])
+                scenario_export.write_geojson(scenario_dir / "evac_paths.geojson", evac_paths[["u", "v", "key", "status", "geometry"]])
+
+                metrics = dict(detail["metrics"])
+                metrics.update(
+                    {
+                        "scenario_id": scenario_id,
+                        "seed": int(seed),
+                        "water_over_threshold": float(water_over_threshold),
+                        "p_background": float(p_background),
+                        "allocation_method": pop_method,
+                        "n_people_allocated": total_people,
+                        "n_frames": int(n_frames),
+                        "date_start": str(pd.Timestamp(start_date).date()),
+                        "date_end": str(pd.Timestamp(end_date).date()),
+                    }
+                )
+                scenario_export.write_json(scenario_dir / "metrics.json", metrics)
+                scenario_export.write_csv(scenario_dir / "failed_edges.csv", detail["failed_edges"])
+                scenario_export.write_csv(scenario_dir / "evac_edges.csv", detail["evac_edges"])
+                scenario_export.write_json(
+                    scenario_dir / "routes.json",
+                    {
+                        "source_node": str(source_node),
+                        "exit_nodes": [str(e) for e in exit_nodes],
+                        "routes": [[str(n) for n in r] if r is not None else None for r in detail["routes"]],
+                    },
+                )
+
+                print(f"export_buildings_geojson={scenario_id}", flush=True)
+                buildings_meta = scenario_export.export_buildings_access_geojson_chunks(
+                    scenario_dir,
+                    detail["buildings"],
+                    people_col="people",
+                    dist_col="dist_to_connected_road_m",
+                    building_id_col="building_id",
+                    include_zero_people=False,
+                    max_chunk_size_mb=95.0,
+                    min_chunks_if_exceeds=2,
+                )
+                zones_meta = scenario_export.export_accessibility_zones_geojson(
+                    scenario_dir,
+                    detail["buildings"],
+                    out_name="accessibility_zones.geojson",
+                    people_col="people",
+                    dist_col="dist_to_connected_road_m",
+                    accessible_col="is_accessible_network",
+                    default_threshold_m=access_radius_m,
+                    cell_size_m=150.0,
+                )
+
+                stranded_summary = scenario_export.summarize_stranded_people_grid(
+                    detail["buildings"],
+                    people_col="people",
+                    dist_col="dist_to_connected_road_m",
+                    accessible_col="is_accessible_network",
+                    default_threshold_m=access_radius_m,
+                    cell_size_m=aggregate_grid_cell_m,
+                )
+                seed_grid_summaries.append(stranded_summary["grid"])
+                if aggregate_metric_crs is None:
+                    aggregate_metric_crs = stranded_summary.get("metric_crs")
+
+                print(f"export_buildings_geojson_done={scenario_id}", flush=True)
+                scenario_export.write_admin_boundary_geojson(scenario_dir, aoi_gdf=aoi)
+
+                manifest = scenario_export.build_manifest(
+                    scenario_id=scenario_id,
+                    n_frames=n_frames,
+                    start_date=str(pd.Timestamp(start_date).date()),
+                    end_date=str(pd.Timestamp(end_date).date()),
+                    parameters={
+                        "seed": int(seed),
+                        "damage_month": damage_month,
+                        "access_radius_m": access_radius_m,
+                        "water_over_threshold": float(water_over_threshold),
+                        "p_background": float(p_background),
+                        "mask_dem_weight": mask_dem_weight,
+                        "mask_threshold": mask_threshold,
+                        "population_allocation_method": pop_method,
+                    },
+                    assets={
+                        "metrics": "metrics.json",
+                        "failed_edges": "failed_edges.csv",
+                        "evac_edges": "evac_edges.csv",
+                        "routes": "routes.json",
+                        "buildings_access_chunks": buildings_meta["files"],
+                        "buildings_access_format": "geojson",
+                        "buildings_access_summary": {
+                            "feature_count": int(buildings_meta["feature_count"]),
+                            "people_total": int(buildings_meta["people_total"]),
+                            "chunk_count": int(buildings_meta["chunk_count"]),
+                            "include_zero_people": False,
+                        },
+                        "accessibility_zones": zones_meta["file"],
+                        "accessibility_zones_summary": {
+                            "zone_count": int(zones_meta.get("zone_count", 0)),
+                            "people_total": int(zones_meta.get("people_total", 0)),
+                            "cell_size_m": float(zones_meta.get("cell_size_m", 600.0)),
+                            "default_threshold_m": float(zones_meta.get("default_threshold_m", access_radius_m)),
+                        },
+                        "admin_boundary": "admin_boundary.geojson",
+                        "roads_base": "roads_base.geojson",
+                        "roads_failed": "roads_failed.geojson",
+                        "evac_paths": "evac_paths.geojson",
+                    },
+                    aoi_bounds_wgs84=list(bounds),
+                    overlay_bounds_wgs84=water_bounds,
+                    frame_dates=frame_dates,
+                    vector_layers={
+                        "roads_base": {"type": "line", "asset": "roads_base.geojson", "color": "#111111"},
+                        "roads_failed": {"type": "line", "asset": "roads_failed.geojson", "color": "#d62728"},
+                        "evac_paths": {"type": "line", "asset": "evac_paths.geojson", "color": "#2ca02c"},
+                        "admin_boundary": {"type": "line", "asset": "admin_boundary.geojson", "color": "#1f77b4"},
+                        "buildings_access": {
+                            "type": "circle",
+                            "asset": "buildings_access_chunks",
+                            "color_ok": "#2ca02c",
+                            "color_bad": "#d62728",
+                        },
+                        "accessibility_zones": {
+                            "type": "fill",
+                            "asset": "accessibility_zones.geojson",
+                            "color_ok": "#2ca02c",
+                            "color_bad": "#d62728",
+                        },
+                    },
+                )
+                manifest_path = scenario_dir / "manifest.json"
+                scenario_export.write_json(manifest_path, manifest)
+                threshold_manifest_paths.append(manifest_path)
+
+                scenario_index_entry = {
                     "scenario_id": scenario_id,
-                    "seed": int(seed),
-                    "p_background": float(p_background),
-                    "allocation_method": pop_method,
-                    "n_people_allocated": total_people,
-                    "n_frames": int(n_frames),
-                    "date_start": str(pd.Timestamp(start_date).date()),
-                    "date_end": str(pd.Timestamp(end_date).date()),
+                    "path": f"{str(args.scenarios_subdir).rstrip('/')}/{scenario_id}/manifest.json",
+                    "parameters": {
+                        "seed": int(seed),
+                        "damage_month": damage_month,
+                        "access_radius_m": access_radius_m,
+                        "water_over_threshold": float(water_over_threshold),
+                        "p_background": float(p_background),
+                    },
                 }
-            )
-            scenario_export.write_json(scenario_dir / "metrics.json", metrics)
-            scenario_export.write_csv(scenario_dir / "failed_edges.csv", detail["failed_edges"])
-            scenario_export.write_csv(scenario_dir / "evac_edges.csv", detail["evac_edges"])
-            scenario_export.write_json(
-                scenario_dir / "routes.json",
-                {
-                    "source_node": str(source_node),
-                    "exit_nodes": [str(e) for e in exit_nodes],
-                    "routes": [[str(n) for n in r] if r is not None else None for r in detail["routes"]],
-                },
-            )
-
-            print(f"export_buildings_geojson={scenario_id}", flush=True)
-            buildings_meta = scenario_export.export_buildings_access_geojson_chunks(
-                scenario_dir,
-                detail["buildings"],
-                people_col="people",
-                dist_col="dist_to_connected_road_m",
-                building_id_col="building_id",
-                include_zero_people=False,
-                max_chunk_size_mb=95.0,
-                min_chunks_if_exceeds=2,
-            )
-            zones_meta = scenario_export.export_accessibility_zones_geojson(
-                scenario_dir,
-                detail["buildings"],
-                out_name="accessibility_zones.geojson",
-                people_col="people",
-                dist_col="dist_to_connected_road_m",
-                accessible_col="is_accessible_network",
-                default_threshold_m=access_radius_m,
-                cell_size_m=60.0,
-            )
-            print(f"export_buildings_geojson_done={scenario_id}", flush=True)
-            scenario_export.write_admin_boundary_geojson(scenario_dir, aoi_gdf=aoi)
-
-            manifest = scenario_export.build_manifest(
-                scenario_id=scenario_id,
-                n_frames=n_frames,
-                start_date=str(pd.Timestamp(start_date).date()),
-                end_date=str(pd.Timestamp(end_date).date()),
-                parameters={
-                    "seed": int(seed),
-                    "damage_month": damage_month,
-                    "access_radius_m": access_radius_m,
-                    "water_over_threshold": water_over_threshold,
-                    "p_background": p_background,
-                    "mask_dem_weight": mask_dem_weight,
-                    "mask_threshold": mask_threshold,
-                    "population_allocation_method": pop_method,
-                },
-                assets={
-                    "metrics": "metrics.json",
-                    "failed_edges": "failed_edges.csv",
-                    "evac_edges": "evac_edges.csv",
-                    "routes": "routes.json",
-                    "buildings_access_chunks": buildings_meta["files"],
-                    "buildings_access_format": "geojson",
-                    "buildings_access_summary": {
-                        "feature_count": int(buildings_meta["feature_count"]),
-                        "people_total": int(buildings_meta["people_total"]),
-                        "chunk_count": int(buildings_meta["chunk_count"]),
-                        "include_zero_people": False,
-                    },
-                    "accessibility_zones": zones_meta["file"],
-                    "accessibility_zones_summary": {
-                        "zone_count": int(zones_meta.get("zone_count", 0)),
-                        "people_total": int(zones_meta.get("people_total", 0)),
-                        "cell_size_m": float(zones_meta.get("cell_size_m", 600.0)),
-                        "default_threshold_m": float(zones_meta.get("default_threshold_m", access_radius_m)),
-                    },
-                    "admin_boundary": "admin_boundary.geojson",
-                    "roads_base": "roads_base.geojson",
-                    "roads_failed": "roads_failed.geojson",
-                    "evac_paths": "evac_paths.geojson",
-                },
-                aoi_bounds_wgs84=list(bounds),
-                overlay_bounds_wgs84=water_bounds,
-                frame_dates=frame_dates,
-                vector_layers={
-                    "roads_base": {"type": "line", "asset": "roads_base.geojson", "color": "#111111"},
-                    "roads_failed": {"type": "line", "asset": "roads_failed.geojson", "color": "#d62728"},
-                    "evac_paths": {"type": "line", "asset": "evac_paths.geojson", "color": "#2ca02c"},
-                    "admin_boundary": {"type": "line", "asset": "admin_boundary.geojson", "color": "#1f77b4"},
-                    "buildings_access": {
-                        "type": "circle",
-                        "asset": "buildings_access_chunks",
-                        "color_ok": "#2ca02c",
-                        "color_bad": "#d62728",
-                    },
-                    "accessibility_zones": {
-                        "type": "fill",
-                        "asset": "accessibility_zones.geojson",
-                        "color_ok": "#2ca02c",
-                        "color_bad": "#d62728",
-                    },
-                },
-            )
-            scenario_export.write_json(scenario_dir / "manifest.json", manifest)
-
-            scenario_index_entry = {
-                "scenario_id": scenario_id,
-                "path": f"{str(args.scenarios_subdir).rstrip('/')}/{scenario_id}/manifest.json",
-                "parameters": {
-                    "seed": int(seed),
-                    "damage_month": damage_month,
-                    "access_radius_m": access_radius_m,
-                    "p_background": float(p_background),
-                },
-            }
-            scenario_options_updates = {
-                "seed": [int(seed)],
-                "damage_month": [damage_month],
-                "access_radius_m": [access_radius_m],
-                "p_background": [float(p_background)],
-            }
-            scenario_export.update_index_json(
-                index_path,
-                scenario_index_entry,
-                options_updates=scenario_options_updates,
-            )
-            if index_path != master_index_path:
+                scenario_options_updates = {
+                    "seed": [int(seed)],
+                    "damage_month": [damage_month],
+                    "access_radius_m": [access_radius_m],
+                    "water_over_threshold": [float(water_over_threshold)],
+                    "p_background": [float(p_background)],
+                }
                 scenario_export.update_index_json(
-                    master_index_path,
+                    index_path,
                     scenario_index_entry,
                     options_updates=scenario_options_updates,
                 )
-            summary_rows.append(metrics)
+                if index_path != master_index_path:
+                    scenario_export.update_index_json(
+                        master_index_path,
+                        scenario_index_entry,
+                        options_updates=scenario_options_updates,
+                    )
+                summary_rows.append(metrics)
+                print(
+                    f"built={scenario_id} wot={water_over_threshold:.6g} p_background={p_background:.6g} "
+                    f"chunks={buildings_meta['chunk_count']} people_total={buildings_meta['people_total']} "
+                    f"zones={zones_meta.get('zone_count', 0)}",
+                    flush=True,
+                )
+
+            aggregates_dir = scenarios_root / "aggregates"
+            scenario_export.ensure_dir(aggregates_dir)
+            agg_filename = f"stranded_seed_aggregate_wot_{wot_slug}_pbg_{pbg_slug}.geojson"
+            agg_meta = scenario_export.export_seed_stranded_aggregate_geojson(
+                aggregates_dir / agg_filename,
+                seed_grid_summaries,
+                metric_crs=aggregate_metric_crs,
+                cell_size_m=aggregate_grid_cell_m,
+            )
+            agg_rel = f"../aggregates/{agg_meta['file']}"
+
+            for manifest_path in threshold_manifest_paths:
+                manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
+                assets_obj = manifest_obj.setdefault("assets", {})
+                assets_obj["stranded_seed_aggregate"] = agg_rel
+                assets_obj["stranded_seed_aggregate_summary"] = {
+                    "cell_count": int(agg_meta.get("cell_count", 0)),
+                    "seed_count": int(agg_meta.get("seed_count", len(scenario_seeds))),
+                    "cell_size_m": float(agg_meta.get("cell_size_m", aggregate_grid_cell_m)),
+                    "water_over_threshold": float(water_over_threshold),
+                    "p_background": float(p_background),
+                }
+                scenario_export.write_json(manifest_path, manifest_obj)
+
             print(
-                f"built={scenario_id} p_background={p_background:.6g} chunks={buildings_meta['chunk_count']} "
-                f"people_total={buildings_meta['people_total']} zones={zones_meta.get('zone_count', 0)}",
+                f"aggregate_built wot={water_over_threshold:.6g} p_background={p_background:.6g} "
+                f"file={agg_filename} cells={agg_meta.get('cell_count', 0)}",
                 flush=True,
             )
 
-    sort_cols = [c for c in ["p_background", "seed"] if c in pd.DataFrame(summary_rows).columns]
+    sort_cols = [c for c in ["water_over_threshold", "p_background", "seed"] if c in pd.DataFrame(summary_rows).columns]
     summary = pd.DataFrame(summary_rows)
     if len(summary) and sort_cols:
         summary = summary.sort_values(sort_cols).reset_index(drop=True)
