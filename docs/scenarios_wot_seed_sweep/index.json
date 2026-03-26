@@ -12,6 +12,17 @@
       }
     },
     {
+      "scenario_id": "barpeta_oct_wot_0p95_seed_21",
+      "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p95_seed_21/manifest.json",
+      "parameters": {
+        "seed": 21,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "water_over_threshold": 0.95,
+        "p_background": 0.02
+      }
+    },
+    {
       "scenario_id": "barpeta_oct_wot_0p95_seed_3",
       "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p95_seed_3/manifest.json",
       "parameters": {
@@ -23,10 +34,32 @@
       }
     },
     {
+      "scenario_id": "barpeta_oct_wot_0p95_seed_42",
+      "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p95_seed_42/manifest.json",
+      "parameters": {
+        "seed": 42,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "water_over_threshold": 0.95,
+        "p_background": 0.02
+      }
+    },
+    {
       "scenario_id": "barpeta_oct_wot_0p95_seed_5",
       "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p95_seed_5/manifest.json",
       "parameters": {
         "seed": 5,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "water_over_threshold": 0.95,
+        "p_background": 0.02
+      }
+    },
+    {
+      "scenario_id": "barpeta_oct_wot_0p95_seed_7",
+      "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p95_seed_7/manifest.json",
+      "parameters": {
+        "seed": 7,
         "damage_month": "oct",
         "access_radius_m": 1000.0,
         "water_over_threshold": 0.95,
