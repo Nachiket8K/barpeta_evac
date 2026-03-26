@@ -538,7 +538,7 @@ def main() -> None:
                 dist_col="dist_to_connected_road_m",
                 accessible_col="is_accessible_network",
                 default_threshold_m=access_radius_m,
-                cell_size_m=600.0,
+                cell_size_m=60.0,
             )
             print(f"export_buildings_geojson_done={scenario_id}", flush=True)
             scenario_export.write_admin_boundary_geojson(scenario_dir, aoi_gdf=aoi)

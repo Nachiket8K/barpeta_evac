@@ -274,7 +274,7 @@ def export_accessibility_zones_geojson(
     dist_col: str = "dist_to_connected_road_m",
     accessible_col: str = "is_accessible_network",
     default_threshold_m: float = 1000.0,
-    cell_size_m: float = 600.0,
+    cell_size_m: float = 60.0,
 ) -> Dict[str, Any]:
     """
     Export rough low-zoom safe/unsafe accessibility zones as grid polygons.
