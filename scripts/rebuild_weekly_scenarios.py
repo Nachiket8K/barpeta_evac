@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+from typing import Optional, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -38,6 +39,108 @@ def _parse_float_list(value: str) -> list[float]:
 def _pbg_slug(v: float) -> str:
     s = f"{float(v):.6g}"
     return s.replace("-", "m").replace(".", "p")
+
+
+def _parse_bbox(value: str) -> tuple[float, float, float, float]:
+    vals = _parse_float_list(value)
+    if len(vals) != 4:
+        raise ValueError("Expected bbox as 4 comma-separated values: left,bottom,right,top")
+    left, bottom, right, top = map(float, vals)
+    if not (left < right and bottom < top):
+        raise ValueError("Invalid bbox ordering; expected left<right and bottom<top")
+    return (left, bottom, right, top)
+
+
+def _expand_bbox(bbox: tuple[float, float, float, float], buffer_deg: float) -> tuple[float, float, float, float]:
+    left, bottom, right, top = bbox
+    b = max(float(buffer_deg), 0.0)
+    return (left - b, bottom - b, right + b, top + b)
+
+
+def _dedupe_preserve_order(nodes: Sequence) -> list:
+    out: list = []
+    seen = set()
+    for n in nodes:
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
+def _subsample_evenly(nodes: Sequence, k: int) -> list:
+    arr = list(nodes)
+    if k <= 0 or len(arr) <= k:
+        return arr
+    idx = np.linspace(0, len(arr) - 1, num=int(k)).astype(int)
+    return [arr[i] for i in idx]
+
+
+def _discover_exit_nodes_via_buffered_graph(
+    *,
+    g_buffered,
+    g_sim,
+    aoi_bbox: tuple[float, float, float, float],
+    epsilon_deg: float,
+    k: int,
+) -> list:
+    """
+    Discover exits on/near AOI boundary that have at least one adjacent road node
+    outside the AOI (i.e., road appears to continue away from AOI).
+    """
+    left, bottom, right, top = aoi_bbox
+    ug = g_buffered.to_undirected(as_view=False)
+
+    candidate_xy: list[tuple[float, float]] = []
+    for n, d in g_buffered.nodes(data=True):
+        x = d.get("x", None)
+        y = d.get("y", None)
+        try:
+            x = float(x)
+            y = float(y)
+        except Exception:
+            continue
+
+        near_boundary = (
+            abs(x - left) <= epsilon_deg
+            or abs(x - right) <= epsilon_deg
+            or abs(y - bottom) <= epsilon_deg
+            or abs(y - top) <= epsilon_deg
+        )
+        if not near_boundary:
+            continue
+
+        has_outward_neighbor = False
+        for nbr in ug.neighbors(n):
+            nd = ug.nodes[nbr]
+            x2 = nd.get("x", None)
+            y2 = nd.get("y", None)
+            try:
+                x2 = float(x2)
+                y2 = float(y2)
+            except Exception:
+                continue
+            outside = (x2 < left) or (x2 > right) or (y2 < bottom) or (y2 > top)
+            if outside:
+                has_outward_neighbor = True
+                break
+
+        if has_outward_neighbor:
+            candidate_xy.append((x, y))
+
+    if not candidate_xy:
+        return []
+
+    mapped = []
+    for x, y in candidate_xy:
+        try:
+            mapped.append(ox.distance.nearest_nodes(g_sim, X=float(x), Y=float(y)))
+        except Exception:
+            continue
+
+    mapped = _dedupe_preserve_order(mapped)
+    mapped = [n for n in mapped if n in g_sim.nodes]
+    return _subsample_evenly(mapped, int(k))
 
 
 def _parse_args() -> argparse.Namespace:
@@ -77,6 +180,55 @@ def _parse_args() -> argparse.Namespace:
         choices=["auto", "none", "numba-cpu", "numba-cuda"],
         help="Acceleration mode for weekly water-mask interpolation.",
     )
+    ap.add_argument(
+        "--source-lon",
+        type=float,
+        default=91.007571,
+        help="Notebook-style fixed source longitude (snapped to nearest graph node).",
+    )
+    ap.add_argument(
+        "--source-lat",
+        type=float,
+        default=26.325782,
+        help="Notebook-style fixed source latitude (snapped to nearest graph node).",
+    )
+    ap.add_argument(
+        "--exit-buffer-deg",
+        type=float,
+        default=0.05,
+        help="Degree buffer around AOI used to fetch buffered OSM roads for explicit exit discovery.",
+    )
+    ap.add_argument(
+        "--exit-k",
+        type=int,
+        default=24,
+        help="Maximum number of exit nodes to keep.",
+    )
+    ap.add_argument(
+        "--exit-epsilon-deg",
+        type=float,
+        default=0.003,
+        help="Boundary tolerance in degrees for exit node detection.",
+    )
+    ap.add_argument(
+        "--exit-bbox-ref",
+        type=str,
+        default="",
+        help="Optional fallback/reference bbox as left,bottom,right,top.",
+    )
+    ap.add_argument(
+        "--exit-buffer-graphml",
+        type=str,
+        default="outputs/tables/roads_exit_buffered.graphml",
+        help="Cache path for buffered OSM road graph used in exit discovery.",
+    )
+    ap.add_argument(
+        "--exit-discovery-mode",
+        type=str,
+        default="buffered",
+        choices=["buffered", "legacy"],
+        help="Exit-node discovery method: buffered (new) or legacy boundary-only.",
+    )
     return ap.parse_args()
 
 
@@ -87,10 +239,11 @@ def main() -> None:
     os.chdir(project_root)
     sys.path.insert(0, str(project_root))
 
-    from src import io, raster_features, scenario_export, simulation
+    from src import io, raster_features, roads, scenario_export, simulation
     from src.config import (
         DEFAULT_ACCESS_RADIUS_M,
         DEFAULT_SCENARIO_SEEDS,
+        EVAC_DRIVABLE_HIGHWAYS,
         WEEKLY_END_DATE,
         WEEKLY_START_DATE,
         WET_CLASS_VALUES,
@@ -113,8 +266,8 @@ def main() -> None:
     access_radius_m = float(DEFAULT_ACCESS_RADIUS_M)
     water_over_threshold = 0.95
     route_weight = "length"
-    exit_k = 24
-    exit_epsilon_deg = 0.003
+    exit_k = int(args.exit_k)
+    exit_epsilon_deg = float(args.exit_epsilon_deg)
 
     graphml_path = Path("outputs/tables/roads_drive_lcc.graphml")
     roads_features_parquet = Path("outputs/tables/roads_edges_features.parquet")
@@ -179,16 +332,78 @@ def main() -> None:
     roads_base["status"] = "intact"
 
     bounds = tuple(aoi.total_bounds.tolist())
-    centroid = aoi.unary_union.centroid
-    source_node = ox.distance.nearest_nodes(g, X=float(centroid.x), Y=float(centroid.y))
-    exit_nodes = simulation.choose_exit_nodes_boundary_bbox(
-        g,
-        bbox=bounds,
-        k=exit_k,
-        epsilon_deg=exit_epsilon_deg,
+    fallback_bbox = _parse_bbox(args.exit_bbox_ref) if str(args.exit_bbox_ref).strip() else bounds
+
+    # Notebook-style fixed source (snapped to nearest graph node)
+    source_node = ox.distance.nearest_nodes(g, X=float(args.source_lon), Y=float(args.source_lat))
+    sx = float(g.nodes[source_node].get("x", np.nan))
+    sy = float(g.nodes[source_node].get("y", np.nan))
+    print(
+        f"source_node={source_node} requested=({float(args.source_lon):.6f},{float(args.source_lat):.6f}) "
+        f"snapped=({sx:.6f},{sy:.6f})",
+        flush=True,
     )
+
+    exit_nodes: list = []
+    if args.exit_discovery_mode == "buffered":
+        buffered_bbox = _expand_bbox(bounds, float(args.exit_buffer_deg))
+        b_left, b_bottom, b_right, b_top = buffered_bbox
+        buffered_graphml = Path(args.exit_buffer_graphml)
+        g_buffered = None
+        if buffered_graphml.exists():
+            try:
+                g_buffered = ox.load_graphml(buffered_graphml)
+                print(f"exit_buffer_graph_loaded={buffered_graphml}", flush=True)
+            except Exception as e:
+                print(f"exit_buffer_graph_load_failed={type(e).__name__}", flush=True)
+
+        if g_buffered is None:
+            try:
+                g_buffered = roads.download_graph_from_bbox(
+                    bbox=(b_top, b_bottom, b_right, b_left),
+                    network_type="all",
+                    simplify=True,
+                    retain_all=True,
+                    timeout=180,
+                )
+                g_buffered = roads.filter_graph_by_highway(g_buffered, EVAC_DRIVABLE_HIGHWAYS)
+                roads.save_graphml(g_buffered, buffered_graphml)
+                print(f"exit_buffer_graph_saved={buffered_graphml}", flush=True)
+            except Exception as e:
+                print(f"exit_buffer_graph_download_failed={type(e).__name__}", flush=True)
+                g_buffered = None
+
+        if g_buffered is not None:
+            exit_nodes = _discover_exit_nodes_via_buffered_graph(
+                g_buffered=g_buffered,
+                g_sim=g,
+                aoi_bbox=bounds,
+                epsilon_deg=exit_epsilon_deg,
+                k=exit_k,
+            )
+            print(
+                f"exit_discovery_mode=buffered aoi_bbox={bounds} buffered_bbox={buffered_bbox} "
+                f"exit_count={len(exit_nodes)}",
+                flush=True,
+            )
+
+    if not exit_nodes:
+        exit_nodes = simulation.choose_exit_nodes_boundary_bbox(
+            g,
+            bbox=fallback_bbox,
+            k=exit_k,
+            epsilon_deg=exit_epsilon_deg,
+        )
+        print(
+            f"exit_discovery_mode=legacy bbox={fallback_bbox} exit_count={len(exit_nodes)}",
+            flush=True,
+        )
+
+    exit_nodes = [n for n in _dedupe_preserve_order(exit_nodes) if n in g.nodes]
     if not exit_nodes:
         raise RuntimeError("No exit nodes found; increase EXIT_EPSILON_DEG")
+
+    print("accessibility_connectivity_basis=lcc (simulation default)", flush=True)
 
     with io.open_population_raster() as pop_src:
         buildings_people = simulation.allocate_population_from_raster_to_buildings(
@@ -199,23 +414,10 @@ def main() -> None:
         )
     pop_method = "raster"
 
-    # Zero-population buildings do not affect people-weighted KPIs and are expensive
-    # to process for distance calculations/export. Keep populated buildings for simulation.
-    buildings_people_sim = buildings_people[buildings_people["people"] > 0].copy()
-    if len(buildings_people_sim):
-        bb = buildings_people_sim.geometry.bounds
-        buildings_people_sim = buildings_people_sim.set_geometry(
-            gpd.points_from_xy(
-                (bb.minx.to_numpy(dtype=float) + bb.maxx.to_numpy(dtype=float)) * 0.5,
-                (bb.miny.to_numpy(dtype=float) + bb.maxy.to_numpy(dtype=float)) * 0.5,
-                crs=buildings_people_sim.crs,
-            )
-        )
-
     total_people = int(buildings_people["people"].sum())
     print(f"population_method={pop_method}")
     print(f"total_people={total_people}")
-    print(f"buildings_total={len(buildings_people)} populated_buildings={len(buildings_people_sim)}")
+    print(f"buildings_total={len(buildings_people)}")
 
     if args.clear_output:
         scenario_export.reset_dir(scenarios_root)
@@ -263,7 +465,7 @@ def main() -> None:
             print(f"running_realization={scenario_id}", flush=True)
             detail = simulation.run_one_realization_detailed(
                 g,
-                buildings_people_sim,
+                buildings_people,
                 source_node,
                 exit_nodes,
                 params,

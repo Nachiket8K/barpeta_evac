@@ -1,0 +1,28 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "barpeta_oct_seed_42",
+      "path": "scenarios_test_alignment/barpeta_oct_seed_42/manifest.json",
+      "parameters": {
+        "seed": 42,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "p_background": 0.02
+      }
+    }
+  ],
+  "options": {
+    "seed": [
+      42
+    ],
+    "damage_month": [
+      "oct"
+    ],
+    "access_radius_m": [
+      1000.0
+    ],
+    "p_background": [
+      0.02
+    ]
+  }
+}
