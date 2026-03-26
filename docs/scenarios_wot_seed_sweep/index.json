@@ -12,6 +12,17 @@
       }
     },
     {
+      "scenario_id": "barpeta_oct_wot_0p95_seed_100",
+      "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p95_seed_100/manifest.json",
+      "parameters": {
+        "seed": 100,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "water_over_threshold": 0.95,
+        "p_background": 0.02
+      }
+    },
+    {
       "scenario_id": "barpeta_oct_wot_0p95_seed_21",
       "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p95_seed_21/manifest.json",
       "parameters": {
@@ -49,6 +60,17 @@
       "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p95_seed_5/manifest.json",
       "parameters": {
         "seed": 5,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "water_over_threshold": 0.95,
+        "p_background": 0.02
+      }
+    },
+    {
+      "scenario_id": "barpeta_oct_wot_0p95_seed_57",
+      "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p95_seed_57/manifest.json",
+      "parameters": {
+        "seed": 57,
         "damage_month": "oct",
         "access_radius_m": 1000.0,
         "water_over_threshold": 0.95,
@@ -153,6 +175,50 @@
         "water_over_threshold": 0.99,
         "p_background": 0.02
       }
+    },
+    {
+      "scenario_id": "barpeta_oct_wot_0p9_seed_1",
+      "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p9_seed_1/manifest.json",
+      "parameters": {
+        "seed": 1,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "water_over_threshold": 0.9,
+        "p_background": 0.02
+      }
+    },
+    {
+      "scenario_id": "barpeta_oct_wot_0p9_seed_3",
+      "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p9_seed_3/manifest.json",
+      "parameters": {
+        "seed": 3,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "water_over_threshold": 0.9,
+        "p_background": 0.02
+      }
+    },
+    {
+      "scenario_id": "barpeta_oct_wot_0p9_seed_5",
+      "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p9_seed_5/manifest.json",
+      "parameters": {
+        "seed": 5,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "water_over_threshold": 0.9,
+        "p_background": 0.02
+      }
+    },
+    {
+      "scenario_id": "barpeta_oct_wot_0p9_seed_7",
+      "path": "scenarios_wot_seed_sweep/barpeta_oct_wot_0p9_seed_7/manifest.json",
+      "parameters": {
+        "seed": 7,
+        "damage_month": "oct",
+        "access_radius_m": 1000.0,
+        "water_over_threshold": 0.9,
+        "p_background": 0.02
+      }
     }
   ],
   "options": {
@@ -173,6 +239,7 @@
       1000.0
     ],
     "water_over_threshold": [
+      0.9,
       0.95,
       0.99
     ],
