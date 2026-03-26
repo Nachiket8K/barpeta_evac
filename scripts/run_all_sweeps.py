@@ -7,16 +7,20 @@ from pathlib import Path
 from typing import Sequence
 
 
+DEFAULT_WATER_THRESHOLDS = "0.99,0.95,0.9,0.85,0.8,0.75,0.6,0.5"
+DEFAULT_SEEDS = "1,3,5,7,21,42,57,100"
+
+
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Run Barpeta scenario sweeps (A/B) in one command."
+        description="Run Barpeta threshold×seed scenario sweeps in one command."
     )
     ap.add_argument(
         "--run",
         type=str,
         default="all",
-        choices=["all", "sweepA", "sweepB"],
-        help="Which sweep group to execute.",
+        choices=["all", "split-thresholds"],
+        help="all = one rebuild call with all thresholds; split-thresholds = one rebuild call per threshold.",
     )
     ap.add_argument(
         "--accel-mode",
@@ -28,7 +32,31 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--clear-output",
         action="store_true",
-        help="Clear each sweep output folder before rebuilding.",
+        help="Clear output folder before rebuilding. In split-threshold mode, applied only on first job.",
+    )
+    ap.add_argument(
+        "--scenarios-subdir",
+        type=str,
+        default="scenarios_wot_seed_sweep",
+        help="Output scenarios subdirectory under docs/.",
+    )
+    ap.add_argument(
+        "--seeds",
+        type=str,
+        default=DEFAULT_SEEDS,
+        help="Comma-separated seeds (default requested set: 1,3,5,7,21,42,57,100).",
+    )
+    ap.add_argument(
+        "--water-over-thresholds",
+        type=str,
+        default=DEFAULT_WATER_THRESHOLDS,
+        help="Comma-separated water_over_threshold values.",
+    )
+    ap.add_argument(
+        "--p-backgrounds",
+        type=str,
+        default="0.02",
+        help="Comma-separated p_background values to include.",
     )
     ap.add_argument(
         "--python-exe",
@@ -44,39 +72,80 @@ def _parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def _build_commands(rebuild_script: Path, accel_mode: str, clear_output: bool) -> list[list[str]]:
+def _parse_float_list(value: str) -> list[float]:
+    vals: list[float] = []
+    for s in str(value).split(","):
+        t = s.strip()
+        if not t:
+            continue
+        vals.append(float(t))
+    if not vals:
+        raise ValueError("Expected at least one float in --water-over-thresholds")
+    return vals
+
+
+def _build_base_cmd(
+    rebuild_script: Path,
+    *,
+    accel_mode: str,
+    scenarios_subdir: str,
+    seeds: str,
+    p_backgrounds: str,
+) -> list[str]:
+    return [
+        str(rebuild_script),
+        "--scenarios-subdir",
+        str(scenarios_subdir),
+        "--seeds",
+        str(seeds),
+        "--p-backgrounds",
+        str(p_backgrounds),
+        "--accel-mode",
+        str(accel_mode),
+    ]
+
+
+def _build_commands(
+    rebuild_script: Path,
+    *,
+    run_mode: str,
+    accel_mode: str,
+    clear_output: bool,
+    scenarios_subdir: str,
+    seeds: str,
+    water_over_thresholds: str,
+    p_backgrounds: str,
+) -> list[list[str]]:
+    base = _build_base_cmd(
+        rebuild_script,
+        accel_mode=accel_mode,
+        scenarios_subdir=scenarios_subdir,
+        seeds=seeds,
+        p_backgrounds=p_backgrounds,
+    )
+
     cmds: list[list[str]] = []
+    if run_mode == "split-thresholds":
+        thr_values = _parse_float_list(water_over_thresholds)
+        for i, thr in enumerate(thr_values):
+            cmd = [
+                *base,
+                "--water-over-thresholds",
+                f"{thr:.6g}",
+            ]
+            if clear_output and i == 0:
+                cmd.append("--clear-output")
+            cmds.append(cmd)
+    else:
+        cmd = [
+            *base,
+            "--water-over-thresholds",
+            str(water_over_thresholds),
+        ]
+        if clear_output:
+            cmd.append("--clear-output")
+        cmds.append(cmd)
 
-    sweep_a = [
-        str(rebuild_script),
-        "--scenarios-subdir",
-        "scenarios_sweepA_seed42_pbg",
-        "--seeds",
-        "42",
-        "--p-backgrounds",
-        "0,0.02,0.05,0.1,0.5",
-        "--accel-mode",
-        accel_mode,
-    ]
-
-    sweep_b = [
-        str(rebuild_script),
-        "--scenarios-subdir",
-        "scenarios_sweepB_pbg002_seeds",
-        "--seeds",
-        "1,5,7,42,100",
-        "--p-backgrounds",
-        "0.02",
-        "--accel-mode",
-        accel_mode,
-    ]
-
-    if clear_output:
-        sweep_a.append("--clear-output")
-        sweep_b.append("--clear-output")
-
-    cmds.append(sweep_a)
-    cmds.append(sweep_b)
     return cmds
 
 
@@ -97,17 +166,16 @@ def main() -> None:
 
     all_cmds = _build_commands(
         rebuild_script=rebuild_script,
+        run_mode=args.run,
         accel_mode=args.accel_mode,
         clear_output=bool(args.clear_output),
+        scenarios_subdir=args.scenarios_subdir,
+        seeds=args.seeds,
+        water_over_thresholds=args.water_over_thresholds,
+        p_backgrounds=args.p_backgrounds,
     )
 
-    selected_cmds: list[list[str]]
-    if args.run == "sweepA":
-        selected_cmds = [all_cmds[0]]
-    elif args.run == "sweepB":
-        selected_cmds = [all_cmds[1]]
-    else:
-        selected_cmds = all_cmds
+    selected_cmds: list[list[str]] = all_cmds
 
     failures = 0
     for i, cmd_tail in enumerate(selected_cmds, start=1):

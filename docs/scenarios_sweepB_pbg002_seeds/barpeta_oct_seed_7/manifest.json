@@ -1,0 +1,128 @@
+{
+  "scenario_id": "barpeta_oct_seed_7",
+  "time": {
+    "start": "2025-05-01",
+    "end": "2025-10-31",
+    "n_frames": 28,
+    "frame_dates": [
+      "2025-05-01",
+      "2025-05-08",
+      "2025-05-15",
+      "2025-05-22",
+      "2025-05-29",
+      "2025-06-05",
+      "2025-06-12",
+      "2025-06-19",
+      "2025-06-26",
+      "2025-07-03",
+      "2025-07-10",
+      "2025-07-17",
+      "2025-07-24",
+      "2025-07-31",
+      "2025-08-07",
+      "2025-08-14",
+      "2025-08-21",
+      "2025-08-28",
+      "2025-09-04",
+      "2025-09-11",
+      "2025-09-18",
+      "2025-09-25",
+      "2025-10-02",
+      "2025-10-09",
+      "2025-10-16",
+      "2025-10-23",
+      "2025-10-30",
+      "2025-10-31"
+    ]
+  },
+  "parameters": {
+    "seed": 7,
+    "damage_month": "oct",
+    "access_radius_m": 1000.0,
+    "water_over_threshold": 0.95,
+    "p_background": 0.02,
+    "mask_dem_weight": 0.25,
+    "mask_threshold": 0.5,
+    "population_allocation_method": "raster"
+  },
+  "layers": {
+    "water_mask": {
+      "frame_path_template": "frames/water_mask/t{frame:04d}.png",
+      "frame_count": 28,
+      "bounds_wgs84": [
+        90.65321740233628,
+        26.089680965154855,
+        91.2900331072486,
+        26.66541123074705
+      ]
+    },
+    "roads_base": {
+      "type": "line",
+      "asset": "roads_base.geojson",
+      "color": "#111111"
+    },
+    "roads_failed": {
+      "type": "line",
+      "asset": "roads_failed.geojson",
+      "color": "#d62728"
+    },
+    "evac_paths": {
+      "type": "line",
+      "asset": "evac_paths.geojson",
+      "color": "#2ca02c"
+    },
+    "admin_boundary": {
+      "type": "line",
+      "asset": "admin_boundary.geojson",
+      "color": "#1f77b4"
+    },
+    "buildings_access": {
+      "type": "circle",
+      "asset": "buildings_access_chunks",
+      "color_ok": "#2ca02c",
+      "color_bad": "#d62728"
+    },
+    "accessibility_zones": {
+      "type": "fill",
+      "asset": "accessibility_zones.geojson",
+      "color_ok": "#2ca02c",
+      "color_bad": "#d62728"
+    }
+  },
+  "assets": {
+    "metrics": "metrics.json",
+    "failed_edges": "failed_edges.csv",
+    "evac_edges": "evac_edges.csv",
+    "routes": "routes.json",
+    "buildings_access_chunks": [
+      "buildings_access_part1.geojson",
+      "buildings_access_part2.geojson"
+    ],
+    "buildings_access_format": "geojson",
+    "buildings_access_summary": {
+      "feature_count": 759631,
+      "people_total": 2899777,
+      "chunk_count": 2,
+      "include_zero_people": false
+    },
+    "accessibility_zones": "accessibility_zones.geojson",
+    "accessibility_zones_summary": {
+      "zone_count": 49130,
+      "people_total": 2899777,
+      "cell_size_m": 150.0,
+      "default_threshold_m": 1000.0
+    },
+    "admin_boundary": "admin_boundary.geojson",
+    "roads_base": "roads_base.geojson",
+    "roads_failed": "roads_failed.geojson",
+    "evac_paths": "evac_paths.geojson"
+  },
+  "aoi": {
+    "bounds_wgs84": [
+      90.65321740233628,
+      26.089680965154855,
+      91.2900331072486,
+      26.66541123074705
+    ]
+  }
+}

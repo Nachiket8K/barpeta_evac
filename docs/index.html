@@ -37,7 +37,7 @@
     <h3 style="margin:0 0 12px 0;">Barpeta Flood Evacuation Scenarios </h3>
 
     <div class="row">
-      <label>Scenario (seed)</label>
+      <label>Scenario</label>
       <select id="scenarioSelect"></select>
       <small id="scenarioInfo"></small>
     </div>
@@ -83,12 +83,28 @@
       <div><input type="checkbox" id="chkFailed" checked /> Damaged roads</div>
       <div><input type="checkbox" id="chkEvac" checked /> Evacuation paths</div>
       <div><input type="checkbox" id="chkBuildings" checked /> Buildings accessibility</div>
+      <div><input type="checkbox" id="chkStranded" checked /> Seed-aggregated stranded cells (30m)</div>
     </div>
 
     <div class="row">
       <label>Accessibility threshold (m)</label>
       <input id="accessThreshold" type="range" min="100" max="5000" step="50" value="1000" />
       <small id="accessThresholdLabel">1000 m</small>
+    </div>
+
+    <div class="row">
+      <label>Stranded-cell rule</label>
+      <select id="strandedMode">
+        <option value="b" selected>B: seed fraction ≥ X%</option>
+        <option value="c">C: mean stranded people ≥ C</option>
+        <option value="bc">B ∩ C: both conditions</option>
+      </select>
+      <label style="margin-top:8px;">B threshold X% (seed fraction)</label>
+      <input id="strandedFracThreshold" type="range" min="0" max="100" step="1" value="50" />
+      <small id="strandedFracThresholdLabel">50%</small>
+      <label style="margin-top:8px;">C threshold (mean stranded people)</label>
+      <input id="strandedMeanThreshold" type="range" min="0" max="500" step="1" value="10" />
+      <small id="strandedMeanThresholdLabel">10</small>
     </div>
 
     <div class="row">
@@ -105,6 +121,7 @@
       <div><span class="chip" style="background:#2ca02c"></span>Evacuation paths</div>
       <div><span class="chip" style="background:#2ca02c"></span>Buildings accessible</div>
       <div><span class="chip" style="background:#d62728"></span>Buildings affected</div>
+      <div><span class="chip" style="background:#000"></span>Seed-aggregated stranded cells (B/C)</div>
     </div>
 
     <hr />
@@ -137,9 +154,15 @@
   const chkFailed = document.getElementById("chkFailed");
   const chkEvac = document.getElementById("chkEvac");
   const chkBuildings = document.getElementById("chkBuildings");
+  const chkStranded = document.getElementById("chkStranded");
 
   const accessThreshold = document.getElementById("accessThreshold");
   const accessThresholdLabel = document.getElementById("accessThresholdLabel");
+  const strandedMode = document.getElementById("strandedMode");
+  const strandedFracThreshold = document.getElementById("strandedFracThreshold");
+  const strandedFracThresholdLabel = document.getElementById("strandedFracThresholdLabel");
+  const strandedMeanThreshold = document.getElementById("strandedMeanThreshold");
+  const strandedMeanThresholdLabel = document.getElementById("strandedMeanThresholdLabel");
 
   const kpiTotal = document.getElementById("kpiTotal");
   const kpiAccessible = document.getElementById("kpiAccessible");
@@ -159,11 +182,15 @@
   const SRC_ZONES = "accessibility-zones";
   const LYR_ZONES_FILL = "accessibility-zones-fill";
   const LYR_ZONES_LINE = "accessibility-zones-line";
+  const SRC_STRANDED = "stranded-seed-aggregate";
+  const LYR_STRANDED_FILL = "stranded-seed-aggregate-fill";
+  const LYR_STRANDED_LINE = "stranded-seed-aggregate-line";
   const SRC_ADMIN = "admin-boundary";
   const LYR_ADMIN = "admin-boundary-layer";
 
   let buildingsFeatures = [];
   let zonesFeatures = [];
+  let strandedFeatures = [];
   let metricsData = null;
   let buildingsChunkUrls = [];
   const buildingsChunkCache = new Map();
@@ -356,6 +383,8 @@
     setLayerVisibility(LYR_BUILDINGS, chkBuildings.checked);
     setLayerVisibility(LYR_ZONES_FILL, chkBuildings.checked);
     setLayerVisibility(LYR_ZONES_LINE, chkBuildings.checked);
+    setLayerVisibility(LYR_STRANDED_FILL, chkStranded.checked);
+    setLayerVisibility(LYR_STRANDED_LINE, chkStranded.checked);
     if (chkBuildings.checked) {
       scheduleBuildingsRefresh(20);
     } else {
@@ -411,6 +440,29 @@
     }
     if (map.getLayer(LYR_ZONES_LINE)) {
       map.setPaintProperty(LYR_ZONES_LINE, "line-color", zoneColorExpr);
+    }
+  }
+
+  function buildStrandedFilterExpression() {
+    const fracThr = (parseFloat(strandedFracThreshold.value) || 0) / 100.0;
+    const meanThr = parseFloat(strandedMeanThreshold.value) || 0;
+    const condB = [">=", ["coalesce", ["to-number", ["get", "stranded_seed_frac"]], -1], fracThr];
+    const condC = [">=", ["coalesce", ["to-number", ["get", "mean_stranded_people"]], -1], meanThr];
+    const mode = (strandedMode.value || "b").toLowerCase();
+    if (mode === "c") return condC;
+    if (mode === "bc") return ["all", condB, condC];
+    return condB;
+  }
+
+  function applyStrandedCriteriaStyle() {
+    if (!map) return;
+    const filterExpr = buildStrandedFilterExpression();
+
+    if (map.getLayer(LYR_STRANDED_FILL)) {
+      map.setFilter(LYR_STRANDED_FILL, filterExpr);
+    }
+    if (map.getLayer(LYR_STRANDED_LINE)) {
+      map.setFilter(LYR_STRANDED_LINE, filterExpr);
     }
   }
 
@@ -595,6 +647,56 @@
     updateAffectedKPIs();
   }
 
+  async function loadStrandedAggregate(base, assets) {
+    if (map.getLayer(LYR_STRANDED_LINE)) map.removeLayer(LYR_STRANDED_LINE);
+    if (map.getLayer(LYR_STRANDED_FILL)) map.removeLayer(LYR_STRANDED_FILL);
+    if (map.getSource(SRC_STRANDED)) map.removeSource(SRC_STRANDED);
+    strandedFeatures = [];
+
+    if (!assets.stranded_seed_aggregate) return;
+
+    const url = `${base}${assets.stranded_seed_aggregate}`;
+    const r = await fetch(url);
+    if (!r.ok) return;
+    const fc = await r.json();
+    strandedFeatures = Array.isArray(fc?.features) ? fc.features : [];
+
+    map.addSource(SRC_STRANDED, {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: strandedFeatures }
+    });
+
+    const beforeId = map.getLayer(LYR_ROADS) ? LYR_ROADS : undefined;
+    map.addLayer(
+      {
+        id: LYR_STRANDED_FILL,
+        type: "fill",
+        source: SRC_STRANDED,
+        paint: {
+          "fill-color": "#000000",
+          "fill-opacity": 0.38
+        }
+      },
+      beforeId
+    );
+
+    map.addLayer(
+      {
+        id: LYR_STRANDED_LINE,
+        type: "line",
+        source: SRC_STRANDED,
+        paint: {
+          "line-color": "#000000",
+          "line-width": 0.4,
+          "line-opacity": 0.75
+        }
+      },
+      beforeId
+    );
+
+    applyStrandedCriteriaStyle();
+  }
+
   async function loadBuildingsLayer(base, assets) {
     if (map.getLayer(LYR_BUILDINGS)) map.removeLayer(LYR_BUILDINGS);
     if (map.getSource(SRC_BUILDINGS)) map.removeSource(SRC_BUILDINGS);
@@ -679,6 +781,7 @@
     }
     await loadAdminBoundary(base, assets);
     await loadAccessibilityZones(base, assets);
+    await loadStrandedAggregate(base, assets);
     await loadBuildingsLayer(base, assets);
 
     if (manifest.parameters && Number.isFinite(Number(manifest.parameters.access_radius_m))) {
@@ -752,6 +855,17 @@
       applyZoneThresholdStyle();
       updateAffectedKPIs();
     });
+    strandedMode.addEventListener("change", () => {
+      applyStrandedCriteriaStyle();
+    });
+    strandedFracThreshold.addEventListener("input", () => {
+      strandedFracThresholdLabel.textContent = `${strandedFracThreshold.value}%`;
+      applyStrandedCriteriaStyle();
+    });
+    strandedMeanThreshold.addEventListener("input", () => {
+      strandedMeanThresholdLabel.textContent = `${strandedMeanThreshold.value}`;
+      applyStrandedCriteriaStyle();
+    });
     document.getElementById("playBtn").addEventListener("click", startPlayback);
     document.getElementById("pauseBtn").addEventListener("click", stopPlayback);
     chkWater.addEventListener("change", updateVisibility);
@@ -759,6 +873,10 @@
     chkFailed.addEventListener("change", updateVisibility);
     chkEvac.addEventListener("change", updateVisibility);
     chkBuildings.addEventListener("change", updateVisibility);
+    chkStranded.addEventListener("change", updateVisibility);
+
+    strandedFracThresholdLabel.textContent = `${strandedFracThreshold.value}%`;
+    strandedMeanThresholdLabel.textContent = `${strandedMeanThreshold.value}`;
   }
 
   bootstrap().catch((err) => {
