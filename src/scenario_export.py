@@ -24,6 +24,10 @@ from shapely import wkt
 from shapely.geometry import box
 
 
+DEFAULT_MAX_EXPORT_FILE_MB: float = 95.0
+GITHUB_HARD_FILE_LIMIT_MB: float = 100.0
+
+
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -58,6 +62,29 @@ def write_geojson(path: Path, gdf: gpd.GeoDataFrame) -> Path:
     text = gdf.to_json(drop_id=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def list_files_over_size(root: Path, max_size_mb: float) -> List[Tuple[Path, int]]:
+    """
+    Return files under root larger than max_size_mb as (path, bytes), sorted largest-first.
+    """
+    if not root.exists():
+        return []
+
+    max_bytes = int(float(max_size_mb) * 1024.0 * 1024.0)
+    out: List[Tuple[Path, int]] = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            sz = int(p.stat().st_size)
+        except Exception:
+            continue
+        if sz > max_bytes:
+            out.append((p, sz))
+
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
 
 
 def _feature_json_size_estimate(
@@ -497,6 +524,8 @@ def export_seed_stranded_aggregate_geojson(
     *,
     metric_crs: Any,
     cell_size_m: float = 30.0,
+    max_chunk_size_mb: float = DEFAULT_MAX_EXPORT_FILE_MB,
+    min_chunks_if_exceeds: int = 2,
 ) -> Dict[str, Any]:
     """
     Export cross-seed stranded-grid aggregation for one threshold setting.
@@ -518,6 +547,7 @@ def export_seed_stranded_aggregate_geojson(
         out_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         return {
             "file": out_path.name,
+            "files": [out_path.name],
             "cell_count": 0,
             "seed_count": int(seed_count),
             "cell_size_m": float(cell_size_m),
@@ -540,6 +570,7 @@ def export_seed_stranded_aggregate_geojson(
         out_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         return {
             "file": out_path.name,
+            "files": [out_path.name],
             "cell_count": 0,
             "seed_count": int(seed_count),
             "cell_size_m": float(cell_size_m),
@@ -587,14 +618,55 @@ def export_seed_stranded_aggregate_geojson(
         "mean_people_total",
         "geometry",
     ]
-    write_geojson(out_path, g_wgs[keep_cols].copy())
+    g_out = g_wgs[keep_cols].copy()
 
-    return {
-        "file": out_path.name,
-        "cell_count": int(len(g_wgs)),
-        "seed_count": int(seed_count),
-        "cell_size_m": float(cell),
-    }
+    n = int(len(g_out))
+    max_bytes = int(float(max_chunk_size_mb) * 1024.0 * 1024.0)
+    chunk_count = 1
+
+    # Iterative split-until-under-threshold approach.
+    while True:
+        # Remove previous chunk artifacts for this basename.
+        for old in out_path.parent.glob(f"{out_path.stem}_part*.geojson"):
+            old.unlink(missing_ok=True)
+
+        files: List[str] = []
+        chunk_sizes: List[int] = []
+
+        if chunk_count <= 1:
+            write_geojson(out_path, g_out)
+            files = [out_path.name]
+            chunk_sizes = [int(out_path.stat().st_size)]
+        else:
+            out_path.unlink(missing_ok=True)
+            rows_per_chunk = int(max(math.ceil(n / float(chunk_count)), 1))
+            for i in range(chunk_count):
+                start = i * rows_per_chunk
+                end = min((i + 1) * rows_per_chunk, n)
+                if start >= end:
+                    break
+                part_name = f"{out_path.stem}_part{i + 1}.geojson"
+                part_path = out_path.parent / part_name
+                write_geojson(part_path, g_out.iloc[start:end].copy())
+                files.append(part_name)
+                chunk_sizes.append(int(part_path.stat().st_size))
+
+        if not chunk_sizes:
+            break
+
+        if max(chunk_sizes) <= max_bytes or chunk_count >= max(n, 1):
+            return {
+                "file": files[0],
+                "files": files,
+                "cell_count": int(n),
+                "seed_count": int(seed_count),
+                "cell_size_m": float(cell),
+                "chunk_count": int(len(files)),
+                "max_chunk_size_mb": float(max_chunk_size_mb),
+                "max_chunk_written_mb": float(max(chunk_sizes) / (1024.0 * 1024.0)),
+            }
+
+        chunk_count = max(int(chunk_count * 2), int(min_chunks_if_exceeds))
 
 
 def write_admin_boundary_geojson(
@@ -813,6 +885,32 @@ def write_weekly_frame_stack(
     return paths
 
 
+def ensure_weekly_frame_stack(
+    masks: Sequence[np.ndarray],
+    out_dir: Path,
+    *,
+    rgb: Tuple[int, int, int] = (65, 155, 223),
+    alpha: int = 140,
+    prefix: str = "t",
+) -> List[Path]:
+    """
+    Ensure weekly frame stack exists on disk; regenerate only if incomplete/missing.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    expected = int(len(masks))
+    existing = sorted(out_dir.glob(f"{prefix}[0-9][0-9][0-9][0-9].png"))
+    if len(existing) == expected:
+        return existing
+
+    return write_weekly_frame_stack(
+        masks,
+        out_dir,
+        rgb=rgb,
+        alpha=alpha,
+        prefix=prefix,
+    )
+
+
 def build_manifest(
     *,
     scenario_id: str,
@@ -825,6 +923,7 @@ def build_manifest(
     overlay_bounds_wgs84: Optional[Sequence[float]] = None,
     frame_dates: Optional[Sequence[str]] = None,
     vector_layers: Optional[Dict[str, Any]] = None,
+    water_frame_path_template: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build a Kivu-style manifest payload.
@@ -839,7 +938,11 @@ def build_manifest(
         "parameters": parameters,
         "layers": {
             "water_mask": {
-                "frame_path_template": "frames/water_mask/t{frame:04d}.png",
+                "frame_path_template": str(
+                    water_frame_path_template
+                    if water_frame_path_template is not None
+                    else "frames/water_mask/t{frame:04d}.png"
+                ),
                 "frame_count": int(n_frames),
             }
         },

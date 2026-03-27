@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -54,6 +55,33 @@ def _parse_bbox(value: str) -> tuple[float, float, float, float]:
     if not (left < right and bottom < top):
         raise ValueError("Invalid bbox ordering; expected left<right and bottom<top")
     return (left, bottom, right, top)
+
+
+def _build_water_mask_cache_key(
+    *,
+    start_date: str,
+    end_date: str,
+    n_frames: int,
+    mask_dem_weight: float,
+    mask_threshold: float,
+    mask_rgba: tuple[int, int, int],
+    mask_alpha: int,
+    water_bounds: Sequence[float],
+    mask_shape: Sequence[int],
+) -> str:
+    payload = {
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "n_frames": int(n_frames),
+        "mask_dem_weight": float(mask_dem_weight),
+        "mask_threshold": float(mask_threshold),
+        "mask_rgba": [int(mask_rgba[0]), int(mask_rgba[1]), int(mask_rgba[2])],
+        "mask_alpha": int(mask_alpha),
+        "water_bounds": [float(x) for x in water_bounds],
+        "mask_shape": [int(mask_shape[0]), int(mask_shape[1])],
+    }
+    txt = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(txt.encode("utf-8")).hexdigest()[:16]
 
 
 def _expand_bbox(bbox: tuple[float, float, float, float], buffer_deg: float) -> tuple[float, float, float, float]:
@@ -246,6 +274,24 @@ def _parse_args() -> argparse.Namespace:
         default=30.0,
         help="Grid size (meters) for cross-seed stranded aggregation export.",
     )
+    ap.add_argument(
+        "--max-export-file-mb",
+        type=float,
+        default=95.0,
+        help="Soft max file size for chunked exports (GeoJSON parts).",
+    )
+    ap.add_argument(
+        "--warn-file-over-mb",
+        type=float,
+        default=95.0,
+        help="Warn when generated scenario files exceed this size (MB). <=0 disables.",
+    )
+    ap.add_argument(
+        "--fail-file-over-mb",
+        type=float,
+        default=100.0,
+        help="Fail when generated scenario files exceed this size (MB). <=0 disables.",
+    )
     return ap.parse_args()
 
 
@@ -286,6 +332,7 @@ def main() -> None:
     exit_k = int(args.exit_k)
     exit_epsilon_deg = float(args.exit_epsilon_deg)
     aggregate_grid_cell_m = float(args.aggregate_grid_cell_m)
+    max_export_file_mb = float(args.max_export_file_mb)
 
     graphml_path = Path("outputs/tables/roads_drive_lcc.graphml")
     roads_features_parquet = Path("outputs/tables/roads_edges_features.parquet")
@@ -332,6 +379,13 @@ def main() -> None:
         flush=True,
     )
     masks = weekly["masks"]
+
+    if len(masks) == 0:
+        raise RuntimeError("No weekly water masks generated")
+
+    m0 = np.asarray(masks[0])
+    if m0.ndim != 2:
+        raise RuntimeError("Unexpected water mask shape; expected 2D array")
 
     g = ox.load_graphml(graphml_path)
     if roads_features_parquet.exists():
@@ -454,6 +508,27 @@ def main() -> None:
 
     summary_rows: list[dict] = []
 
+    water_cache_key = _build_water_mask_cache_key(
+        start_date=str(pd.Timestamp(start_date).date()),
+        end_date=str(pd.Timestamp(end_date).date()),
+        n_frames=n_frames,
+        mask_dem_weight=mask_dem_weight,
+        mask_threshold=mask_threshold,
+        mask_rgba=mask_rgba,
+        mask_alpha=mask_alpha,
+        water_bounds=water_bounds,
+        mask_shape=m0.shape,
+    )
+    water_shared_dir = scenarios_root / "_shared" / "water_mask" / water_cache_key
+    scenario_export.ensure_weekly_frame_stack(
+        masks,
+        water_shared_dir,
+        rgb=mask_rgba,
+        alpha=mask_alpha,
+        prefix="t",
+    )
+    water_frame_path_template = f"../_shared/water_mask/{water_cache_key}/t{{frame:04d}}.png"
+
     include_pbg_in_id = bool(args.force_pbg_in_id) or (len(p_background_values) > 1)
 
     for p_background in p_background_values:
@@ -472,14 +547,7 @@ def main() -> None:
                 scenario_dir = scenarios_root / scenario_id
                 scenario_export.reset_dir(scenario_dir)
 
-                scenario_export.write_weekly_frame_stack(
-                    masks,
-                    scenario_dir / "frames" / "water_mask",
-                    rgb=mask_rgba,
-                    alpha=mask_alpha,
-                )
-
-                print(f"frames_written={scenario_id}", flush=True)
+                print(f"frames_linked={scenario_id} cache_key={water_cache_key}", flush=True)
 
                 params = simulation.SimulationParams(
                     month=damage_month,
@@ -560,7 +628,7 @@ def main() -> None:
                     dist_col="dist_to_connected_road_m",
                     building_id_col="building_id",
                     include_zero_people=False,
-                    max_chunk_size_mb=95.0,
+                    max_chunk_size_mb=max_export_file_mb,
                     min_chunks_if_exceeds=2,
                 )
                 zones_meta = scenario_export.export_accessibility_zones_geojson(
@@ -632,6 +700,7 @@ def main() -> None:
                     aoi_bounds_wgs84=list(bounds),
                     overlay_bounds_wgs84=water_bounds,
                     frame_dates=frame_dates,
+                    water_frame_path_template=water_frame_path_template,
                     vector_layers={
                         "roads_base": {"type": "line", "asset": "roads_base.geojson", "color": "#111111"},
                         "roads_failed": {"type": "line", "asset": "roads_failed.geojson", "color": "#d62728"},
@@ -700,17 +769,24 @@ def main() -> None:
                 seed_grid_summaries,
                 metric_crs=aggregate_metric_crs,
                 cell_size_m=aggregate_grid_cell_m,
+                max_chunk_size_mb=max_export_file_mb,
+                min_chunks_if_exceeds=2,
             )
-            agg_rel = f"../aggregates/{agg_meta['file']}"
+            agg_rel_files = [f"../aggregates/{n}" for n in agg_meta.get("files", [agg_meta["file"]])]
+            agg_rel = agg_rel_files[0] if agg_rel_files else f"../aggregates/{agg_meta['file']}"
 
             for manifest_path in threshold_manifest_paths:
                 manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
                 assets_obj = manifest_obj.setdefault("assets", {})
                 assets_obj["stranded_seed_aggregate"] = agg_rel
+                assets_obj["stranded_seed_aggregate_parts"] = agg_rel_files
                 assets_obj["stranded_seed_aggregate_summary"] = {
                     "cell_count": int(agg_meta.get("cell_count", 0)),
                     "seed_count": int(agg_meta.get("seed_count", len(scenario_seeds))),
                     "cell_size_m": float(agg_meta.get("cell_size_m", aggregate_grid_cell_m)),
+                    "chunk_count": int(agg_meta.get("chunk_count", len(agg_rel_files))),
+                    "max_chunk_size_mb": float(agg_meta.get("max_chunk_size_mb", max_export_file_mb)),
+                    "max_chunk_written_mb": float(agg_meta.get("max_chunk_written_mb", 0.0)),
                     "water_over_threshold": float(water_over_threshold),
                     "p_background": float(p_background),
                 }
@@ -727,6 +803,29 @@ def main() -> None:
     if len(summary) and sort_cols:
         summary = summary.sort_values(sort_cols).reset_index(drop=True)
     summary.to_csv(scenarios_root / "scenario_summary.csv", index=False)
+
+    warn_mb = float(args.warn_file_over_mb)
+    if warn_mb > 0:
+        warn_files = scenario_export.list_files_over_size(scenarios_root, warn_mb)
+        if warn_files:
+            print(f"size_warn_threshold_mb={warn_mb:.3f} offending_files={len(warn_files)}", flush=True)
+            for p, sz in warn_files[:200]:
+                rel = p.relative_to(project_root)
+                print(f"size_warn file={rel.as_posix()} size_mb={sz / (1024.0 * 1024.0):.3f}", flush=True)
+
+    fail_mb = float(args.fail_file_over_mb)
+    if fail_mb > 0:
+        fail_files = scenario_export.list_files_over_size(scenarios_root, fail_mb)
+        if fail_files:
+            print(f"size_fail_threshold_mb={fail_mb:.3f} offending_files={len(fail_files)}", flush=True)
+            for p, sz in fail_files[:200]:
+                rel = p.relative_to(project_root)
+                print(f"size_fail file={rel.as_posix()} size_mb={sz / (1024.0 * 1024.0):.3f}", flush=True)
+            raise RuntimeError(
+                f"Generated files exceed fail-file-over-mb threshold ({fail_mb} MB). "
+                f"Use smaller cell/chunk settings or adjust threshold."
+            )
+
     print("done", flush=True)
 
 

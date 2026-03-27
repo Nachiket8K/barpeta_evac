@@ -653,13 +653,30 @@
     if (map.getSource(SRC_STRANDED)) map.removeSource(SRC_STRANDED);
     strandedFeatures = [];
 
-    if (!assets.stranded_seed_aggregate) return;
+    const partList = Array.isArray(assets.stranded_seed_aggregate_parts) && assets.stranded_seed_aggregate_parts.length
+      ? assets.stranded_seed_aggregate_parts
+      : (assets.stranded_seed_aggregate ? [assets.stranded_seed_aggregate] : []);
+    if (!partList.length) return;
 
-    const url = `${base}${assets.stranded_seed_aggregate}`;
-    const r = await fetch(url);
-    if (!r.ok) return;
-    const fc = await r.json();
-    strandedFeatures = Array.isArray(fc?.features) ? fc.features : [];
+    const partUrls = partList.map((p) => `${base}${p}`);
+    const collections = await Promise.all(
+      partUrls.map(async (url) => {
+        const r = await fetch(url);
+        if (!r.ok) return null;
+        try {
+          return await r.json();
+        } catch (_) {
+          return null;
+        }
+      })
+    );
+
+    strandedFeatures = [];
+    for (const fc of collections) {
+      if (!fc || !Array.isArray(fc.features)) continue;
+      strandedFeatures.push(...fc.features);
+    }
+    if (!strandedFeatures.length) return;
 
     map.addSource(SRC_STRANDED, {
       type: "geojson",

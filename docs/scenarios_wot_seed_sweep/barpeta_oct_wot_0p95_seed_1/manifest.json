@@ -116,14 +116,21 @@
     "roads_base": "roads_base.geojson",
     "roads_failed": "roads_failed.geojson",
     "evac_paths": "evac_paths.geojson",
-    "stranded_seed_aggregate": "../aggregates/stranded_seed_aggregate_wot_0p95_pbg_0p02.geojson",
+    "stranded_seed_aggregate": "../aggregates/stranded_seed_aggregate_wot_0p95_pbg_0p02_part1.geojson",
     "stranded_seed_aggregate_summary": {
       "cell_count": 327082,
       "seed_count": 8,
       "cell_size_m": 30.0,
       "water_over_threshold": 0.95,
-      "p_background": 0.02
-    }
+      "p_background": 0.02,
+      "chunk_count": 2,
+      "max_chunk_size_mb": 95.0,
+      "max_chunk_written_mb": 67.31805419921875
+    },
+    "stranded_seed_aggregate_parts": [
+      "../aggregates/stranded_seed_aggregate_wot_0p95_pbg_0p02_part1.geojson",
+      "../aggregates/stranded_seed_aggregate_wot_0p95_pbg_0p02_part2.geojson"
+    ]
   },
   "aoi": {
     "bounds_wgs84": [

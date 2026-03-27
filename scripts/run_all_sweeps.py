@@ -69,6 +69,24 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Continue remaining sweeps even if one command fails.",
     )
+    ap.add_argument(
+        "--max-export-file-mb",
+        type=float,
+        default=95.0,
+        help="Forwarded soft max file size for chunked GeoJSON exports.",
+    )
+    ap.add_argument(
+        "--warn-file-over-mb",
+        type=float,
+        default=95.0,
+        help="Forwarded warn threshold for generated scenario file sizes (<=0 disables).",
+    )
+    ap.add_argument(
+        "--fail-file-over-mb",
+        type=float,
+        default=100.0,
+        help="Forwarded hard-fail threshold for generated scenario file sizes (<=0 disables).",
+    )
     return ap.parse_args()
 
 
@@ -91,6 +109,9 @@ def _build_base_cmd(
     scenarios_subdir: str,
     seeds: str,
     p_backgrounds: str,
+    max_export_file_mb: float,
+    warn_file_over_mb: float,
+    fail_file_over_mb: float,
 ) -> list[str]:
     return [
         str(rebuild_script),
@@ -102,6 +123,12 @@ def _build_base_cmd(
         str(p_backgrounds),
         "--accel-mode",
         str(accel_mode),
+        "--max-export-file-mb",
+        f"{float(max_export_file_mb):.6g}",
+        "--warn-file-over-mb",
+        f"{float(warn_file_over_mb):.6g}",
+        "--fail-file-over-mb",
+        f"{float(fail_file_over_mb):.6g}",
     ]
 
 
@@ -115,6 +142,9 @@ def _build_commands(
     seeds: str,
     water_over_thresholds: str,
     p_backgrounds: str,
+    max_export_file_mb: float,
+    warn_file_over_mb: float,
+    fail_file_over_mb: float,
 ) -> list[list[str]]:
     base = _build_base_cmd(
         rebuild_script,
@@ -122,6 +152,9 @@ def _build_commands(
         scenarios_subdir=scenarios_subdir,
         seeds=seeds,
         p_backgrounds=p_backgrounds,
+        max_export_file_mb=max_export_file_mb,
+        warn_file_over_mb=warn_file_over_mb,
+        fail_file_over_mb=fail_file_over_mb,
     )
 
     cmds: list[list[str]] = []
@@ -173,6 +206,9 @@ def main() -> None:
         seeds=args.seeds,
         water_over_thresholds=args.water_over_thresholds,
         p_backgrounds=args.p_backgrounds,
+        max_export_file_mb=float(args.max_export_file_mb),
+        warn_file_over_mb=float(args.warn_file_over_mb),
+        fail_file_over_mb=float(args.fail_file_over_mb),
     )
 
     selected_cmds: list[list[str]] = all_cmds
