@@ -83,7 +83,7 @@
       <div><input type="checkbox" id="chkFailed" checked /> Damaged roads</div>
       <div><input type="checkbox" id="chkEvac" checked /> Evacuation paths</div>
       <div><input type="checkbox" id="chkBuildings" checked /> Buildings accessibility</div>
-      
+      <div><input type="checkbox" id="chkStranded" checked /> Seed-aggregated stranded cells (30m)</div>
     </div>
 
     <div class="row">
@@ -107,7 +107,7 @@
       <div><span class="chip" style="background:#2ca02c"></span>Evacuation paths</div>
       <div><span class="chip" style="background:#2ca02c"></span>Buildings accessible</div>
       <div><span class="chip" style="background:#d62728"></span>Buildings affected</div>
-      
+      <div><span class="chip" style="background:#000"></span>Seed-aggregated stranded cells (B/C)</div>
     </div>
 
     <hr />
@@ -140,7 +140,8 @@
   const chkFailed = document.getElementById("chkFailed");
   const chkEvac = document.getElementById("chkEvac");
   const chkBuildings = document.getElementById("chkBuildings");
-  
+  const chkStranded = document.getElementById("chkStranded");
+
   const accessThreshold = document.getElementById("accessThreshold");
   const accessThresholdLabel = document.getElementById("accessThresholdLabel");
   const strandedMode = document.getElementById("strandedMode");
