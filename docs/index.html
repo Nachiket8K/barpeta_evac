@@ -430,6 +430,13 @@
   }
 
   function buildStrandedFilterExpression() {
+    // Some deployments omit stranded-control widgets from the sidebar.
+    // Keep filters functional (show all stranded features) instead of throwing
+    // null-reference errors that break all downstream event bindings.
+    if (!strandedMode || !strandedFracThreshold || !strandedMeanThreshold) {
+      return ["==", 1, 1];
+    }
+
     const fracThr = (parseFloat(strandedFracThreshold.value) || 0) / 100.0;
     const meanThr = parseFloat(strandedMeanThreshold.value) || 0;
     const condB = [">=", ["coalesce", ["to-number", ["get", "stranded_seed_frac"]], -1], fracThr];
@@ -858,17 +865,27 @@
       applyZoneThresholdStyle();
       updateAffectedKPIs();
     });
-    strandedMode.addEventListener("change", () => {
-      applyStrandedCriteriaStyle();
-    });
-    strandedFracThreshold.addEventListener("input", () => {
-      strandedFracThresholdLabel.textContent = `${strandedFracThreshold.value}%`;
-      applyStrandedCriteriaStyle();
-    });
-    strandedMeanThreshold.addEventListener("input", () => {
-      strandedMeanThresholdLabel.textContent = `${strandedMeanThreshold.value}`;
-      applyStrandedCriteriaStyle();
-    });
+    if (strandedMode) {
+      strandedMode.addEventListener("change", () => {
+        applyStrandedCriteriaStyle();
+      });
+    }
+    if (strandedFracThreshold) {
+      strandedFracThreshold.addEventListener("input", () => {
+        if (strandedFracThresholdLabel) {
+          strandedFracThresholdLabel.textContent = `${strandedFracThreshold.value}%`;
+        }
+        applyStrandedCriteriaStyle();
+      });
+    }
+    if (strandedMeanThreshold) {
+      strandedMeanThreshold.addEventListener("input", () => {
+        if (strandedMeanThresholdLabel) {
+          strandedMeanThresholdLabel.textContent = `${strandedMeanThreshold.value}`;
+        }
+        applyStrandedCriteriaStyle();
+      });
+    }
     document.getElementById("playBtn").addEventListener("click", startPlayback);
     document.getElementById("pauseBtn").addEventListener("click", stopPlayback);
     chkWater.addEventListener("change", updateVisibility);
@@ -878,8 +895,12 @@
     chkBuildings.addEventListener("change", updateVisibility);
     chkStranded.addEventListener("change", updateVisibility);
 
-    strandedFracThresholdLabel.textContent = `${strandedFracThreshold.value}%`;
-    strandedMeanThresholdLabel.textContent = `${strandedMeanThreshold.value}`;
+    if (strandedFracThreshold && strandedFracThresholdLabel) {
+      strandedFracThresholdLabel.textContent = `${strandedFracThreshold.value}%`;
+    }
+    if (strandedMeanThreshold && strandedMeanThresholdLabel) {
+      strandedMeanThresholdLabel.textContent = `${strandedMeanThreshold.value}`;
+    }
   }
 
   bootstrap().catch((err) => {
